@@ -306,3 +306,106 @@ The notebook exports:
 ## Conclusion
 
 This project demonstrates the development of a multi-stock algorithmic trading backtesting framework using Python and SQL. It combines historical data analysis, technical indicators, trading simulation, transaction-cost modeling, risk metrics, and benchmark comparison to evaluate quantitative trading strategies.
+
+# Statistical Arbitrage and Pairs Trading Strategy Backtester
+
+## Project Overview
+
+This project implements a Python-based statistical arbitrage research and backtesting system using historical stock market data.
+
+It analyzes the relationship between two stocks, estimates their hedge ratio, identifies potential mean-reversion opportunities, and evaluates a pairs-trading strategy using historical price movements.
+
+The project uses RELIANCE.NS and ONGC.NS as the selected stock pair.
+
+## Objectives
+
+- Analyze relationships between stock prices.
+- Test cointegration between selected stocks.
+- Estimate hedge ratios using OLS regression.
+- Calculate spread and Z-scores.
+- Estimate mean-reversion half-life using an Ornstein-Uhlenbeck (OU) model.
+- Generate long-spread and short-spread trading signals.
+- Evaluate strategy performance on training and testing datasets.
+
+## Technologies Used
+
+- Python
+- Pandas
+- NumPy
+- Matplotlib
+- Statsmodels
+- YFinance
+- SQLite
+- Jupyter Notebook
+
+## Methodology
+
+### 1. Data Collection and Preprocessing
+- Fetch historical stock prices using Yahoo Finance.
+- Align stock prices based on trading dates.
+- Handle missing values and prepare the dataset.
+
+### 2. Statistical Analysis
+- Calculate correlation between the selected stocks.
+- Perform the Engle-Granger cointegration test.
+- Estimate the hedge ratio using OLS regression.
+
+### 3. Mean-Reversion Analysis
+- Calculate the price spread using the estimated hedge ratio.
+- Estimate mean-reversion speed and half-life using the OU approach.
+- Calculate rolling Z-scores to identify spread deviations.
+
+### 4. Trading Signal Generation
+- Generate a short-spread signal when Z-score reaches the upper threshold.
+- Generate a long-spread signal when Z-score reaches the lower threshold.
+- Exit positions when the spread moves back towards its mean.
+- Apply a stop-loss threshold to manage adverse movements.
+
+### 5. Backtesting and Performance Evaluation
+- Use chronological training and testing datasets.
+- Simulate trading positions with a one-day execution lag.
+- Include simplified transaction costs.
+- Evaluate total return, CAGR, Sharpe ratio and maximum drawdown.
+- Maintain individual trade records.
+
+## Database and Outputs
+
+The project creates an SQLite database named `pairs_trading.db` containing:
+
+- `stock_prices`
+- `pair_signals`
+- `trade_log`
+
+Generated output files:
+
+- `stock_prices.csv`
+- `pair_signals.csv`
+- `performance_metrics.csv`
+- `trade_log.csv`
+
+Visualizations:
+
+- Spread and Z-score analysis
+- Portfolio performance
+- Strategy drawdown
+
+## Key Findings
+
+- Observed strong correlation between RELIANCE and ONGC.
+- The Engle-Granger cointegration test did not pass the 5% significance threshold.
+- Training and testing performance showed different results.
+- Out-of-sample results highlighted the importance of statistical validation and strategy generalization.
+
+## Limitations
+
+- Uses daily historical price data rather than tick-level data.
+- Tests only one stock pair.
+- Uses a fixed hedge ratio.
+- Transaction costs are simplified.
+- Does not simulate order-book execution, queue position, partial fills or market latency.
+
+## Conclusion
+
+This project demonstrates the application of statistical modelling, quantitative research, and backtesting techniques in financial markets. It also highlights why correlation alone is insufficient to establish a reliable pairs-trading relationship and why out-of-sample validation is important.
+
+**Note:** This is an educational quantitative research and backtesting project, not a production-ready trading system or a recommendation to trade.

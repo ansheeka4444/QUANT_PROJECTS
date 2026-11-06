@@ -1,0 +1,1199 @@
+
+# ============================================================
+# PROJECT 4: LIMIT ORDER BOOK & EXECUTION SIMULATOR
+# Microstructure | FIFO Queue | Partial Fills | Latency | SQL
+# COMPLETE UPDATED VERSION
+# ============================================================
+
+%pip install -q pandas numpy matplotlib
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import sqlite3
+import warnings
+from collections import deque
+
+warnings.filterwarnings("ignore")
+np.random.seed(42)
+
+print("Libraries loaded successfully!")
+print("Starting Limit Order Book Execution Engine...")
+
+# ============================================================
+# 1. ORDER DATA STRUCTURE
+# ============================================================
+
+class Order:
+
+    def __init__(self, order_id, side, price, qty, timestamp):
+
+        if side not in ["BUY", "SELL"]:
+            raise ValueError("Side must be BUY or SELL")
+
+        if qty <= 0:
+            raise ValueError("Quantity must be positive")
+
+        if price is not None and price <= 0:
+            raise ValueError("Price must be positive")
+
+        self.order_id = order_id
+        self.side = side
+        self.price = price
+        self.qty = qty
+        self.timestamp = timestamp
+
+        self.filled = 0
+        self.status = "NEW"
+
+    @property
+    def remaining(self):
+        return self.qty - self.filled
+
+
+# ============================================================
+# 2. LIMIT ORDER BOOK ENGINE
+# ============================================================
+
+class OrderBook:
+
+    def __init__(self):
+
+        self.bids = {}
+        self.asks = {}
+
+        self.trade_history = []
+        self.event_history = []
+        self.orders = {}
+
+    def log_event(self, order, event_type, details=""):
+
+        self.event_history.append({
+
+            "Order_ID": order.order_id,
+            "Side": order.side,
+            "Event": event_type,
+            "Price": order.price,
+            "Quantity": order.qty,
+            "Filled": order.filled,
+            "Remaining": order.remaining,
+            "Timestamp": order.timestamp,
+            "Status": order.status,
+            "Details": details
+
+        })
+
+    def register_order(self, order):
+
+        if order.order_id in self.orders:
+            raise ValueError(
+                f"Duplicate Order ID: {order.order_id}"
+            )
+
+        self.orders[order.order_id] = order
+
+    # --------------------------------------------------------
+    # LIMIT ORDER EXECUTION
+    # --------------------------------------------------------
+
+    def add_limit_order(self, order):
+
+        self.register_order(order)
+
+        self.log_event(
+            order,
+            "LIMIT_ORDER_SUBMITTED"
+        )
+
+        trades = self.match_order(
+            order,
+            market_order=False
+        )
+
+        if order.remaining > 0:
+
+            book = (
+                self.bids
+                if order.side == "BUY"
+                else self.asks
+            )
+
+            if order.price not in book:
+                book[order.price] = deque()
+
+            # Remaining quantity joins the FIFO queue
+            book[order.price].append(order)
+
+            if order.filled > 0:
+                order.status = "PARTIALLY_FILLED"
+            else:
+                order.status = "ACTIVE"
+
+            self.log_event(
+                order,
+                "LIMIT_ORDER_RESTING"
+            )
+
+        else:
+
+            order.status = "FILLED"
+
+        return trades
+
+    # --------------------------------------------------------
+    # MARKET ORDER EXECUTION
+    # --------------------------------------------------------
+
+    def execute_market_order(self, order):
+
+        self.register_order(order)
+
+        self.log_event(
+            order,
+            "MARKET_ORDER_SUBMITTED"
+        )
+
+        trades = self.match_order(
+            order,
+            market_order=True
+        )
+
+        # Market orders never rest in the book.
+        if order.remaining > 0:
+
+            if order.filled > 0:
+                order.status = "PARTIALLY_FILLED_CANCELLED"
+            else:
+                order.status = "UNFILLED_CANCELLED"
+
+            self.log_event(
+                order,
+                "MARKET_REMAINDER_CANCELLED"
+            )
+
+        else:
+
+            order.status = "FILLED"
+
+        return trades
+
+    # --------------------------------------------------------
+    # FIFO PRICE-TIME MATCHING ENGINE
+    # --------------------------------------------------------
+
+    def match_order(self, incoming_order, market_order=False):
+
+        trades = []
+
+        opposite_book = (
+            self.asks
+            if incoming_order.side == "BUY"
+            else self.bids
+        )
+
+        # Best price first
+        prices = sorted(
+            opposite_book.keys(),
+            reverse=(incoming_order.side == "SELL")
+        )
+
+        for price in prices:
+
+            # Stop if a limit order cannot cross this price
+            if not market_order:
+
+                if incoming_order.side == "BUY":
+                    if incoming_order.price < price:
+                        break
+
+                else:
+                    if incoming_order.price > price:
+                        break
+
+            queue = opposite_book[price]
+
+            # FIFO matching at each price level
+            while queue and incoming_order.remaining > 0:
+
+                resting_order = queue[0]
+
+                available_qty = resting_order.remaining
+                required_qty = incoming_order.remaining
+
+                trade_qty = min(
+                    available_qty,
+                    required_qty
+                )
+
+                resting_order.filled += trade_qty
+                incoming_order.filled += trade_qty
+
+                trade = {
+
+                    "Timestamp": incoming_order.timestamp,
+                    "Price": price,
+                    "Quantity": trade_qty,
+
+                    "Buyer_ID": (
+                        incoming_order.order_id
+                        if incoming_order.side == "BUY"
+                        else resting_order.order_id
+                    ),
+
+                    "Seller_ID": (
+                        incoming_order.order_id
+                        if incoming_order.side == "SELL"
+                        else resting_order.order_id
+                    ),
+
+                    "Aggressor_Side": incoming_order.side
+
+                }
+
+                trades.append(trade)
+                self.trade_history.append(trade)
+
+                self.log_event(
+                    incoming_order,
+                    "TRADE_EXECUTED",
+                    f"Executed {trade_qty} at {price}"
+                )
+
+                self.log_event(
+                    resting_order,
+                    "RESTING_ORDER_FILLED",
+                    f"Executed {trade_qty} at {price}"
+                )
+
+                if resting_order.remaining == 0:
+
+                    resting_order.status = "FILLED"
+                    queue.popleft()
+
+                else:
+
+                    # Preserve FIFO priority for remaining quantity
+                    resting_order.status = "PARTIALLY_FILLED"
+                    break
+
+            if not queue:
+                del opposite_book[price]
+
+            if incoming_order.remaining == 0:
+                incoming_order.status = "FILLED"
+                break
+
+        return trades
+
+    # --------------------------------------------------------
+    # BEST BID / ASK
+    # --------------------------------------------------------
+
+    def get_best_bid(self):
+
+        return (
+            max(self.bids.keys())
+            if self.bids
+            else None
+        )
+
+    def get_best_ask(self):
+
+        return (
+            min(self.asks.keys())
+            if self.asks
+            else None
+        )
+
+    # --------------------------------------------------------
+    # QUEUE POSITION
+    # --------------------------------------------------------
+
+    def get_queue_position(self, order_id):
+
+        for book in [self.bids, self.asks]:
+
+            for price, queue in book.items():
+
+                for i, order in enumerate(queue):
+
+                    if order.order_id == order_id:
+
+                        qty_ahead = sum(
+                            o.remaining
+                            for o in list(queue)[:i]
+                        )
+
+                        return qty_ahead
+
+        return None
+
+    # --------------------------------------------------------
+    # ORDER CANCELLATION
+    # --------------------------------------------------------
+
+    def cancel_order(self, order_id):
+
+        order = self.orders.get(order_id)
+
+        if order is None:
+            return False
+
+        if order.status not in [
+            "ACTIVE",
+            "PARTIALLY_FILLED"
+        ]:
+            return False
+
+        book = (
+            self.bids
+            if order.side == "BUY"
+            else self.asks
+        )
+
+        if order.price in book:
+
+            queue = book[order.price]
+
+            for resting_order in list(queue):
+
+                if resting_order.order_id == order_id:
+
+                    queue.remove(resting_order)
+
+                    if not queue:
+                        del book[order.price]
+
+                    order.status = "CANCELLED"
+
+                    self.log_event(
+                        order,
+                        "ORDER_CANCELLED"
+                    )
+
+                    return True
+
+        return False
+
+    # --------------------------------------------------------
+    # ORDER BOOK DEPTH
+    # --------------------------------------------------------
+
+    def get_depth(self):
+
+        rows = []
+
+        for price, queue in self.bids.items():
+
+            rows.append({
+
+                "Side": "BUY",
+                "Price": price,
+                "Quantity": sum(
+                    o.remaining for o in queue
+                )
+
+            })
+
+        for price, queue in self.asks.items():
+
+            rows.append({
+
+                "Side": "SELL",
+                "Price": price,
+                "Quantity": sum(
+                    o.remaining for o in queue
+                )
+
+            })
+
+        return pd.DataFrame(rows)
+
+
+# ============================================================
+# 3. SYNTHETIC MARKET SIMULATION
+# ============================================================
+
+print("\nCreating synthetic order book...")
+
+book = OrderBook()
+
+order_id_counter = 1
+base_price = 100.00
+
+# Seed initial market depth
+for _ in range(50):
+
+    side = np.random.choice(["BUY", "SELL"])
+
+    if side == "BUY":
+
+        price = round(
+            base_price - np.random.uniform(0.01, 0.50),
+            2
+        )
+
+    else:
+
+        price = round(
+            base_price + np.random.uniform(0.01, 0.50),
+            2
+        )
+
+    qty = np.random.randint(10, 100)
+
+    order = Order(
+        order_id_counter,
+        side,
+        price,
+        qty,
+        timestamp=0
+    )
+
+    book.add_limit_order(order)
+
+    order_id_counter += 1
+
+print("Initial order book created!")
+
+print("Best Bid:", book.get_best_bid())
+print("Best Ask:", book.get_best_ask())
+
+
+# ============================================================
+# 4. MARKET ORDER & SLIPPAGE ANALYSIS
+# ============================================================
+
+print("\n--- MARKET ORDER SLIPPAGE ANALYSIS ---")
+
+market_order_results = []
+
+for i in range(5):
+
+    size = np.random.randint(150, 300)
+
+    best_ask_before = book.get_best_ask()
+
+    order = Order(
+        order_id_counter,
+        "BUY",
+        price=None,
+        qty=size,
+        timestamp=i + 1
+    )
+
+    order_id_counter += 1
+
+    trades = book.execute_market_order(order)
+
+    if trades and order.filled > 0:
+
+        avg_fill = (
+            sum(
+                t["Price"] * t["Quantity"]
+                for t in trades
+            ) / order.filled
+        )
+
+        slippage_bps = (
+            (avg_fill - best_ask_before)
+            / best_ask_before
+        ) * 10000
+
+    else:
+
+        avg_fill = None
+        slippage_bps = None
+
+    fill_rate = (
+        order.filled / order.qty
+    ) * 100
+
+    market_order_results.append({
+
+        "Order_ID": order.order_id,
+        "Side": order.side,
+        "Target_Qty": size,
+        "Filled_Qty": order.filled,
+        "Unfilled_Qty": order.remaining,
+        "Fill_Rate_Pct": round(fill_rate, 2),
+        "Expected_Price": best_ask_before,
+        "Avg_Fill_Price": (
+            round(avg_fill, 4)
+            if avg_fill is not None
+            else None
+        ),
+        "Slippage_Bps": (
+            round(slippage_bps, 2)
+            if slippage_bps is not None
+            else None
+        ),
+        "Status": order.status
+
+    })
+
+slippage_df = pd.DataFrame(market_order_results)
+
+display(slippage_df)
+
+
+# ============================================================
+# 5. QUEUE POSITION & PARTIAL FILL SIMULATION
+# ============================================================
+
+print("\n--- QUEUE POSITION & PARTIAL FILLS ---")
+
+best_bid = book.get_best_bid()
+
+if best_bid is None:
+    raise RuntimeError("No bid liquidity available!")
+
+passive_order = Order(
+    order_id_counter,
+    "BUY",
+    price=best_bid,
+    qty=50,
+    timestamp=10
+)
+
+order_id_counter += 1
+
+book.add_limit_order(passive_order)
+
+q_pos_before = book.get_queue_position(
+    passive_order.order_id
+)
+
+print(
+    f"Passive Order ID: {passive_order.order_id}"
+)
+
+print(
+    f"Order Price: {passive_order.price}"
+)
+
+print(
+    f"Quantity Ahead Before Execution: {q_pos_before}"
+)
+
+# Sell enough quantity to consume orders ahead
+# and partially fill our passive order by 20 units.
+
+sell_qty = q_pos_before + 20
+
+small_sell = Order(
+    order_id_counter,
+    "SELL",
+    price=None,
+    qty=sell_qty,
+    timestamp=11
+)
+
+order_id_counter += 1
+
+book.execute_market_order(small_sell)
+
+q_pos_after = book.get_queue_position(
+    passive_order.order_id
+)
+
+queue_results = pd.DataFrame([{
+
+    "Order_ID": passive_order.order_id,
+    "Queue_Before": q_pos_before,
+    "Queue_After": q_pos_after,
+    "Original_Qty": passive_order.qty,
+    "Filled_Qty": passive_order.filled,
+    "Remaining_Qty": passive_order.remaining,
+    "Status": passive_order.status
+
+}])
+
+display(queue_results)
+
+print(
+    "Partial fill successfully demonstrated:",
+    passive_order.filled,
+    "units filled"
+)
+
+
+# ============================================================
+# 6. ORDER CANCELLATION TEST
+# ============================================================
+
+print("\n--- ORDER CANCELLATION TEST ---")
+
+cancel_order = Order(
+    order_id_counter,
+    "BUY",
+    price=1.00,
+    qty=25,
+    timestamp=12
+)
+
+order_id_counter += 1
+
+book.add_limit_order(cancel_order)
+
+cancel_success = book.cancel_order(
+    cancel_order.order_id
+)
+
+cancellation_results = pd.DataFrame([{
+
+    "Order_ID": cancel_order.order_id,
+    "Cancellation_Success": cancel_success,
+    "Final_Status": cancel_order.status,
+    "Remaining_Qty": cancel_order.remaining
+
+}])
+
+display(cancellation_results)
+
+
+# ============================================================
+# 7. LATENCY IMPACT SIMULATION
+# ============================================================
+
+print("\n--- LATENCY IMPACT SIMULATION ---")
+
+def simulate_latency(order_qty, initial_book, latency_ms=250):
+
+    expected_ask = initial_book.get_best_ask()
+
+    if expected_ask is None:
+        return None
+
+    # Calculate liquidity at the best ask level
+    best_level_qty = sum(
+        order.remaining
+        for order in initial_book.asks[expected_ask]
+    )
+
+    # During simulated latency, another market participant
+    # consumes the displayed liquidity at the best ask.
+    competitor_order = Order(
+        900001,
+        "BUY",
+        price=None,
+        qty=best_level_qty,
+        timestamp=20
+    )
+
+    competitor_trades = initial_book.execute_market_order(
+        competitor_order
+    )
+
+    # Our order arrives after the competing execution
+    user_order = Order(
+        900002,
+        "BUY",
+        price=None,
+        qty=order_qty,
+        timestamp=21
+    )
+
+    user_trades = initial_book.execute_market_order(
+        user_order
+    )
+
+    if user_order.filled > 0:
+
+        avg_price = (
+            sum(
+                t["Price"] * t["Quantity"]
+                for t in user_trades
+            ) / user_order.filled
+        )
+
+        latency_cost = avg_price - expected_ask
+
+        latency_cost_bps = (
+            latency_cost / expected_ask
+        ) * 10000
+
+    else:
+
+        avg_price = None
+        latency_cost = None
+        latency_cost_bps = None
+
+    return {
+
+        "Expected_Ask": expected_ask,
+        "Actual_Avg_Fill": avg_price,
+        "Latency_Cost": latency_cost,
+        "Latency_Cost_Bps": latency_cost_bps,
+        "Latency_ms": latency_ms,
+        "Competitor_Consumed_Qty": competitor_order.filled,
+        "Our_Filled_Qty": user_order.filled,
+        "Our_Unfilled_Qty": user_order.remaining,
+        "Fill_Rate_Pct": (
+            user_order.filled / order_qty
+        ) * 100
+
+    }
+
+
+# Build a separate book with multiple ask price levels
+latency_book = OrderBook()
+
+latency_order_id = 100000
+
+for level in range(5):
+
+    price = round(100.00 + level * 0.01, 2)
+
+    for _ in range(2):
+
+        latency_book.add_limit_order(
+
+            Order(
+                latency_order_id,
+                "SELL",
+                price,
+                100,
+                timestamp=0
+            )
+
+        )
+
+        latency_order_id += 1
+
+
+latency_result = simulate_latency(
+    order_qty=50,
+    initial_book=latency_book,
+    latency_ms=250
+)
+
+latency_df = pd.DataFrame([latency_result])
+
+display(latency_df)
+
+if latency_result["Actual_Avg_Fill"] is not None:
+
+    print(
+        f"Expected Ask: "
+        f"{latency_result['Expected_Ask']:.2f}"
+    )
+
+    print(
+        f"Actual Fill: "
+        f"{latency_result['Actual_Avg_Fill']:.2f}"
+    )
+
+    print(
+        f"Latency Cost: "
+        f"{latency_result['Latency_Cost_Bps']:.2f} bps"
+    )
+
+else:
+
+    print("No execution available after simulated latency.")
+
+
+# ============================================================
+# 8. TRADE HISTORY & ORDER LOG
+# ============================================================
+
+trades_hist_df = pd.DataFrame(
+    book.trade_history
+)
+
+events_df = pd.DataFrame(
+    book.event_history
+)
+
+order_log_df = pd.DataFrame([{
+
+    "Order_ID": order.order_id,
+    "Side": order.side,
+    "Price": order.price,
+    "Original_Qty": order.qty,
+    "Filled_Qty": order.filled,
+    "Remaining_Qty": order.remaining,
+    "Timestamp": order.timestamp,
+    "Status": order.status
+
+} for order in book.orders.values()])
+
+
+print("\n--- TRADE HISTORY ---")
+
+if not trades_hist_df.empty:
+    display(trades_hist_df.head(10))
+else:
+    print("No trades recorded.")
+
+
+print("\n--- ORDER LOG ---")
+
+display(order_log_df.head(10))
+
+
+# ============================================================
+# 9. EXECUTION PERFORMANCE SUMMARY
+# ============================================================
+
+print("\n--- EXECUTION PERFORMANCE SUMMARY ---")
+
+total_orders = len(slippage_df)
+
+total_target_qty = slippage_df["Target_Qty"].sum()
+
+total_filled_qty = slippage_df["Filled_Qty"].sum()
+
+overall_fill_rate = (
+    total_filled_qty / total_target_qty * 100
+    if total_target_qty > 0
+    else 0
+)
+
+avg_slippage = slippage_df[
+    "Slippage_Bps"
+].mean()
+
+summary_df = pd.DataFrame([{
+
+    "Total_Market_Orders": total_orders,
+    "Target_Quantity": total_target_qty,
+    "Filled_Quantity": total_filled_qty,
+    "Overall_Fill_Rate_Pct": round(
+        overall_fill_rate, 2
+    ),
+    "Average_Slippage_Bps": round(
+        avg_slippage, 2
+    ) if pd.notna(avg_slippage) else None,
+    "Total_Executed_Trades": len(trades_hist_df)
+
+}])
+
+display(summary_df)
+
+
+# ============================================================
+# 10. SQL DATABASE STORAGE
+# ============================================================
+
+print("\n--- SAVING RESULTS TO SQL ---")
+
+conn = sqlite3.connect(
+    "hft_execution_simulator.db"
+)
+
+if not trades_hist_df.empty:
+
+    trades_hist_df.to_sql(
+        "trade_history",
+        conn,
+        if_exists="replace",
+        index=False
+    )
+
+slippage_df.to_sql(
+    "market_order_slippage",
+    conn,
+    if_exists="replace",
+    index=False
+)
+
+queue_results.to_sql(
+    "queue_analysis",
+    conn,
+    if_exists="replace",
+    index=False
+)
+
+latency_df.to_sql(
+    "latency_analysis",
+    conn,
+    if_exists="replace",
+    index=False
+)
+
+events_df.to_sql(
+    "order_events",
+    conn,
+    if_exists="replace",
+    index=False
+)
+
+order_log_df.to_sql(
+    "order_log",
+    conn,
+    if_exists="replace",
+    index=False
+)
+
+summary_df.to_sql(
+    "execution_summary",
+    conn,
+    if_exists="replace",
+    index=False
+)
+
+cancellation_results.to_sql(
+    "cancellation_analysis",
+    conn,
+    if_exists="replace",
+    index=False
+)
+
+conn.close()
+
+print("SQL database saved successfully!")
+
+print("\nDatabase Tables:")
+
+print("""
+1. trade_history
+2. market_order_slippage
+3. queue_analysis
+4. latency_analysis
+5. order_events
+6. order_log
+7. execution_summary
+8. cancellation_analysis
+""")
+
+
+# ============================================================
+# 11. CSV EXPORT
+# ============================================================
+
+slippage_df.to_csv(
+    "execution_slippage.csv",
+    index=False
+)
+
+queue_results.to_csv(
+    "queue_analysis.csv",
+    index=False
+)
+
+latency_df.to_csv(
+    "latency_analysis.csv",
+    index=False
+)
+
+order_log_df.to_csv(
+    "order_log.csv",
+    index=False
+)
+
+events_df.to_csv(
+    "order_events.csv",
+    index=False
+)
+
+summary_df.to_csv(
+    "execution_summary.csv",
+    index=False
+)
+
+cancellation_results.to_csv(
+    "cancellation_analysis.csv",
+    index=False
+)
+
+if not trades_hist_df.empty:
+
+    trades_hist_df.to_csv(
+        "trade_history.csv",
+        index=False
+    )
+
+print("All CSV files exported successfully!")
+
+
+# ============================================================
+# 12. VISUALIZATION 1: ORDER BOOK DEPTH
+# ============================================================
+
+print("\n--- ORDER BOOK DEPTH VISUALIZATION ---")
+
+plt.figure(figsize=(12, 5))
+
+bids = sorted(
+    book.bids.keys(),
+    reverse=True
+)[:10]
+
+asks = sorted(
+    book.asks.keys()
+)[:10]
+
+if bids:
+
+    bid_vols = [
+
+        sum(
+            order.remaining
+            for order in book.bids[p]
+        )
+
+        for p in bids
+
+    ]
+
+    plt.bar(
+        bids,
+        bid_vols,
+        alpha=0.6,
+        label="Bids"
+    )
+
+
+if asks:
+
+    ask_vols = [
+
+        sum(
+            order.remaining
+            for order in book.asks[p]
+        )
+
+        for p in asks
+
+    ]
+
+    plt.bar(
+        asks,
+        ask_vols,
+        alpha=0.6,
+        label="Asks"
+    )
+
+
+plt.title("Level-2 Order Book Depth")
+plt.xlabel("Price")
+plt.ylabel("Available Quantity")
+plt.legend()
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+
+# ============================================================
+# 13. VISUALIZATION 2: MARKET ORDER SLIPPAGE
+# ============================================================
+
+plt.figure(figsize=(10, 5))
+
+plt.bar(
+    slippage_df["Order_ID"].astype(str),
+    slippage_df["Slippage_Bps"].fillna(0)
+)
+
+plt.title("Market Order Slippage Analysis")
+plt.xlabel("Order ID")
+plt.ylabel("Slippage (Basis Points)")
+plt.grid(axis="y", alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+
+# ============================================================
+# 14. VISUALIZATION 3: FILL RATE
+# ============================================================
+
+plt.figure(figsize=(10, 5))
+
+plt.bar(
+    slippage_df["Order_ID"].astype(str),
+    slippage_df["Fill_Rate_Pct"]
+)
+
+plt.title("Market Order Fill Rate")
+plt.xlabel("Order ID")
+plt.ylabel("Fill Rate (%)")
+plt.ylim(0, 110)
+plt.grid(axis="y", alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+
+# ============================================================
+# 15. VISUALIZATION 4: QUEUE POSITION
+# ============================================================
+
+plt.figure(figsize=(8, 5))
+
+queue_labels = [
+    "Before Execution",
+    "After Execution"
+]
+
+queue_values = [
+    q_pos_before,
+    q_pos_after if q_pos_after is not None else 0
+]
+
+plt.bar(
+    queue_labels,
+    queue_values
+)
+
+plt.title("FIFO Queue Position Analysis")
+plt.ylabel("Quantity Ahead")
+plt.grid(axis="y", alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+
+# ============================================================
+# 16. VISUALIZATION 5: LATENCY COST
+# ============================================================
+
+if latency_result["Latency_Cost_Bps"] is not None:
+
+    plt.figure(figsize=(7, 5))
+
+    plt.bar(
+        ["Latency Cost"],
+        [latency_result["Latency_Cost_Bps"]]
+    )
+
+    plt.title("Simulated Latency Impact")
+    plt.ylabel("Execution Cost (BPS)")
+    plt.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+
+# ============================================================
+# 17. FINAL PROJECT STATUS
+# ============================================================
+
+print("\n" + "=" * 55)
+
+print("PROJECT 4 EXECUTION COMPLETED SUCCESSFULLY!")
+
+print("=" * 55)
+
+print("\nFeatures Implemented:")
+
+print("""
+1. Synthetic Market Data
+2. Limit Order Book Engine
+3. FIFO Price-Time Priority
+4. Market Order Execution
+5. Limit Order Execution
+6. Partial Fill Handling
+7. Unfilled Market Order Cancellation
+8. Queue Position Tracking
+9. Order Cancellation
+10. Bid-Ask Depth Analysis
+11. Slippage Calculation
+12. Simulated Latency Impact
+13. Fill Rate Analysis
+14. SQL Database Storage
+15. CSV Data Export
+16. Performance Visualizations
+""")
+
+print("Database: hft_execution_simulator.db")
+
+print("PROJECT 4 COMPLETE!")

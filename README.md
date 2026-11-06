@@ -409,3 +409,129 @@ Visualizations:
 This project demonstrates the application of statistical modelling, quantitative research, and backtesting techniques in financial markets. It also highlights why correlation alone is insufficient to establish a reliable pairs-trading relationship and why out-of-sample validation is important.
 
 **Note:** This is an educational quantitative research and backtesting project, not a production-ready trading system or a recommendation to trade.
+
+# Limit Order Book & High-Frequency Trade Execution Simulator
+
+## Project Overview
+
+This project implements a Python-based Limit Order Book (LOB) and trade execution simulator to explore market microstructure and high-frequency trading concepts.
+
+It generates synthetic market orders and limit orders, maintains bid and ask queues using FIFO (First-In-First-Out) price-time priority, and simulates trade matching, partial fills, order cancellations, slippage, and latency impact.
+
+The simulator also evaluates execution performance through fill rates, transaction prices, and execution costs, with results stored in an SQLite database.
+
+## Objectives
+
+- Understand limit order book mechanics.
+- Implement FIFO price-time priority.
+- Simulate market and limit order execution.
+- Handle partial fills and unfilled quantities.
+- Track order queue positions.
+- Simulate order cancellations.
+- Analyze execution slippage and latency impact.
+- Evaluate order fill rates.
+- Store execution records using SQL.
+
+## Technologies Used
+
+- Python
+- Pandas
+- NumPy
+- Matplotlib
+- SQLite
+- Jupyter Notebook
+- Python Collections (`deque`)
+
+## Key Features
+
+### 1. Synthetic Market Data Generation
+- Generate synthetic bid and ask orders.
+- Create price levels and order quantities.
+- Initialize a simulated order book.
+
+### 2. Limit Order Book Engine
+- Maintain separate bid and ask sides.
+- Organize orders by price levels.
+- Implement FIFO queues using Python `deque`.
+- Apply price-time priority during order matching.
+
+### 3. Order Execution
+- Simulate incoming market and limit orders.
+- Match compatible buy and sell orders.
+- Support multiple executions against different resting orders.
+- Handle partial fills and remaining quantities.
+- Cancel unfilled market order quantities.
+
+### 4. Queue Position Analysis
+- Track the quantity ahead of a resting limit order.
+- Analyze queue position before and after incoming market orders.
+- Demonstrate partial execution of passive orders.
+
+### 5. Order Cancellation
+- Implement order cancellation.
+- Remove active orders from the order book.
+- Track cancellation status and remaining quantity.
+
+### 6. Execution Cost Analysis
+- Calculate average execution prices.
+- Measure slippage in basis points.
+- Compare expected prices with actual fill prices.
+- Analyze fill rates and unfilled quantities.
+
+### 7. Latency Impact Simulation
+- Simulate competing liquidity consumption during order transmission delay.
+- Compare expected and actual execution prices.
+- Estimate the additional execution cost caused by simulated latency.
+
+### 8. SQL Database and Data Export
+The project creates an SQLite database named `hft_execution_simulator.db`.
+
+Database tables:
+
+- `trade_history`
+- `market_order_slippage`
+- `queue_analysis`
+- `latency_analysis`
+- `order_events`
+- `order_log`
+- `execution_summary`
+- `cancellation_analysis`
+
+CSV outputs include execution slippage, trade history, queue analysis, latency analysis, and execution summaries.
+
+## Execution Results
+
+The completed simulation produced the following results:
+
+| Metric | Result |
+|---|---:|
+| Total Market Orders | 5 |
+| Target Quantity | 1,041 |
+| Filled Quantity | 928 |
+| Overall Fill Rate | 89.15% |
+| Average Slippage | 4.51 bps |
+| Executed Trades | 25 |
+| Simulated Latency Cost | 1.00 bps |
+
+These results are specific to the generated synthetic market and simulation parameters.
+
+## Visualizations
+
+The notebook generates an order book depth visualization showing the available bid and ask quantities across price levels.
+
+## Limitations
+
+- Uses synthetic market data rather than live exchange feeds.
+- Does not reproduce actual exchange infrastructure.
+- Latency is simulated rather than measured from a live trading system.
+- Queue position assumes the simulator's internal FIFO order book.
+- Does not model all real-world exchange rules, network delays, or market impact.
+- Execution results depend on synthetic order generation and simulation parameters.
+
+## Conclusion
+
+This project demonstrates practical implementation of limit order book mechanics, FIFO matching, order execution, queue position tracking, partial fills, slippage analysis, and simulated latency effects.
+
+It provides a foundation for understanding market microstructure and execution-related challenges in high-frequency trading systems.
+
+**Note:** This is an educational synthetic execution simulator, not a production-ready HFT trading engine or a live trading system.

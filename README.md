@@ -125,3 +125,184 @@ Threshold selection is based on historical observations and requires out-of-samp
 - Short-horizon signal evaluation.
 - Backtesting and risk metric calculation.
 - SQL-based financial data analysis.
+
+# Algorithmic Trading Strategy Backtesting and Performance Evaluation
+
+## Project Overview
+
+This project implements a Python-based algorithmic trading backtesting framework to evaluate a Moving Average (MA) Crossover strategy across five major Indian NSE-listed stocks.
+
+The framework uses historical stock market data to generate trading signals, simulate trade execution, account for transaction costs and slippage, and evaluate strategy performance against a Buy-and-Hold benchmark.
+
+It also incorporates chronological training and testing datasets to examine out-of-sample performance.
+
+## Objectives
+
+- Develop a rule-based algorithmic trading strategy.
+- Analyze historical stock market data.
+- Generate trading signals using technical indicators.
+- Simulate next-day order execution.
+- Account for transaction costs and slippage.
+- Evaluate risk-adjusted trading performance.
+- Compare strategy returns with a benchmark.
+- Store and analyze results using SQL.
+
+## Technologies Used
+
+| Technology | Purpose |
+|---|---|
+| Python | Strategy development |
+| Pandas | Data manipulation |
+| NumPy | Numerical calculations |
+| Matplotlib | Data visualization |
+| yfinance | Historical market data |
+| SQLite | Database management |
+| Jupyter Notebook | Development and analysis |
+
+## Stocks Analyzed
+
+The framework analyzes the following NSE-listed stocks:
+
+- Reliance Industries (RELIANCE.NS)
+- Tata Consultancy Services (TCS.NS)
+- Infosys (INFY.NS)
+- HDFC Bank (HDFCBANK.NS)
+- ICICI Bank (ICICIBANK.NS)
+
+Historical daily OHLCV data is downloaded using Yahoo Finance through the yfinance library.
+
+## Methodology
+
+### 1. Data Collection and Preprocessing
+
+- Download historical OHLCV data.
+- Handle missing and invalid values.
+- Remove duplicate timestamps.
+- Validate stock prices.
+- Organize data chronologically.
+
+### 2. Technical Indicator Calculation
+
+The strategy uses:
+
+- Simple Moving Average (SMA 20)
+- Simple Moving Average (SMA 50)
+- Exponential Moving Average (EMA 20)
+
+### 3. Trading Signal Generation
+
+A moving-average crossover strategy generates trading signals.
+
+- BUY: 20-day SMA is above 50-day SMA.
+- SELL: 20-day SMA moves below or becomes equal to 50-day SMA.
+- HOLD: No position change is required.
+
+Signals are generated using closing-price information and executed at the next available trading day's opening price.
+
+### 4. Backtesting
+
+The framework simulates historical trading activity using:
+
+- Long-only positions.
+- Next-day opening-price execution.
+- Position-change detection.
+- Transaction-cost modeling.
+- Slippage assumptions.
+- Strategy return calculation.
+
+### 5. Train-Test Evaluation
+
+The historical dataset is divided chronologically:
+
+- Training data: 70%
+- Testing data: 30%
+
+Moving averages are calculated using historical observations before the split so that the testing period retains the required indicator warm-up history.
+
+The strategy is evaluated separately on training and testing periods.
+
+### 6. Performance Evaluation
+
+The framework calculates:
+
+- Total Return
+- Compound Annual Growth Rate (CAGR)
+- Sharpe Ratio
+- Maximum Drawdown
+- Annualized Volatility
+- Win Rate
+- Profit Factor
+- Average Trade Return
+
+Strategy performance is compared against a Buy-and-Hold benchmark.
+
+## SQL Database Integration
+
+SQLite stores the backtesting results and trade information.
+
+Database tables include:
+
+- `multi_ticker_results`
+- `trade_log`
+- `trade_metrics`
+- Individual stock backtesting tables
+
+SQL queries are used to:
+
+1. Rank stocks by testing-period Sharpe ratio.
+2. Summarize winning and losing trades.
+3. Compare trade performance across stocks.
+
+## Visualizations
+
+The project generates:
+
+- Multi-stock strategy equity curves.
+- Strategy vs Buy-and-Hold comparisons.
+- Training vs testing Sharpe ratio charts.
+- Portfolio drawdown comparisons.
+
+## Project Outputs
+
+The notebook exports:
+
+- `multi_ticker_results.csv`
+- `trade_log.csv`
+- `trade_metrics.csv`
+- Individual stock backtesting CSV files.
+- `algorithmic_trading.db`
+
+## How to Run
+
+1. Install Python and Jupyter Notebook.
+2. Install the required libraries:
+
+   ```bash
+   pip install pandas numpy matplotlib yfinance
+   ```
+
+3. Open the Jupyter Notebook.
+4. Run the notebook cells sequentially.
+5. Ensure internet connectivity for historical data downloads.
+6. Review the generated metrics, charts, SQL outputs, and CSV files.
+
+## Limitations
+
+- Uses daily market data rather than tick-level or Level-2 order book data.
+- Assumes simplified execution at the next trading day's opening price.
+- Transaction costs and slippage are modeled using fixed assumptions.
+- Does not simulate actual exchange latency, queue priority, partial fills, or market impact.
+- Historical backtesting does not guarantee future trading performance.
+
+## Future Enhancements
+
+- Implement intraday and tick-level backtesting.
+- Integrate Level-2 order book data.
+- Explore momentum and mean-reversion strategies.
+- Implement walk-forward validation.
+- Add parameter optimization using training data.
+- Incorporate realistic execution and market-impact models.
+
+## Conclusion
+
+This project demonstrates the development of a multi-stock algorithmic trading backtesting framework using Python and SQL. It combines historical data analysis, technical indicators, trading simulation, transaction-cost modeling, risk metrics, and benchmark comparison to evaluate quantitative trading strategies.

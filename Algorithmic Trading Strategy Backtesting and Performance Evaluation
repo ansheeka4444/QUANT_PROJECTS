@@ -1,0 +1,1223 @@
+
+# ============================================================
+# PROJECT 2: ALGORITHMIC TRADING STRATEGY BACKTESTER
+# MULTI-STOCK | TRAIN/TEST | SQL | PERFORMANCE ANALYSIS
+# Strategy: 20 SMA / 50 SMA Crossover
+# Execution: Next-day Open
+# ============================================================
+
+%pip install -q pandas numpy matplotlib yfinance
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import yfinance as yf
+import sqlite3
+import warnings
+import os
+
+warnings.filterwarnings("ignore")
+
+print("Libraries imported successfully!")
+
+
+# ============================================================
+# 1. CONFIGURATION
+# ============================================================
+
+TICKERS = [
+    "RELIANCE.NS",
+    "TCS.NS",
+    "INFY.NS",
+    "HDFCBANK.NS",
+    "ICICIBANK.NS"
+]
+
+PERIOD = "3y"
+INTERVAL = "1d"
+
+SHORT_WINDOW = 20
+LONG_WINDOW = 50
+
+INITIAL_CAPITAL = 100000
+
+TRANSACTION_COST_BPS = 10
+SLIPPAGE_BPS = 5
+
+COST_PER_SIDE = (
+    TRANSACTION_COST_BPS + SLIPPAGE_BPS
+) / 10000
+
+TRAIN_SPLIT = 0.70
+
+DATABASE = "algorithmic_trading.db"
+
+print("\nConfiguration ready!")
+print("Stocks:", TICKERS)
+print("Period:", PERIOD)
+print("Transaction cost per side:", COST_PER_SIDE * 10000, "bps")
+
+
+# ============================================================
+# 2. DOWNLOAD HISTORICAL DATA
+# ============================================================
+
+def download_data(ticker):
+
+    try:
+
+        raw = yf.download(
+            ticker,
+            period=PERIOD,
+            interval=INTERVAL,
+            auto_adjust=True,
+            progress=False,
+            threads=False
+        )
+
+        if raw is None or raw.empty:
+            print("No data available:", ticker)
+            return pd.DataFrame()
+
+        # Handle MultiIndex columns
+        if isinstance(raw.columns, pd.MultiIndex):
+
+            try:
+                raw = raw.xs(
+                    ticker,
+                    axis=1,
+                    level=-1
+                )
+
+            except (KeyError, ValueError):
+
+                raw.columns = raw.columns.get_level_values(0)
+
+        required = [
+            "Open",
+            "High",
+            "Low",
+            "Close",
+            "Volume"
+        ]
+
+        if not all(col in raw.columns for col in required):
+
+            print("Required columns missing:", ticker)
+            return pd.DataFrame()
+
+        data = raw[required].copy()
+
+        data.index = pd.to_datetime(data.index)
+
+        data = data[
+            ~data.index.duplicated(keep="first")
+        ].sort_index()
+
+        for col in required:
+
+            data[col] = pd.to_numeric(
+                data[col],
+                errors="coerce"
+            )
+
+        data = data.replace(
+            [np.inf, -np.inf],
+            np.nan
+        )
+
+        data = data.dropna(
+            subset=["Open", "Close"]
+        )
+
+        data = data[
+            (data["Open"] > 0) &
+            (data["Close"] > 0)
+        ]
+
+        return data
+
+    except Exception as e:
+
+        print("Download failed:", ticker, str(e))
+        return pd.DataFrame()
+
+
+# ============================================================
+# 3. FEATURE ENGINEERING AND BACKTESTING
+# ============================================================
+
+def backtest_ma(
+    data,
+    short=SHORT_WINDOW,
+    long=LONG_WINDOW,
+    capital=INITIAL_CAPITAL,
+    cost=COST_PER_SIDE
+):
+
+    if data is None or len(data) < long + 10:
+        return None
+
+    work = data.copy()
+
+    # Moving averages
+    work["SMA_Short"] = (
+        work["Close"].rolling(short).mean()
+    )
+
+    work["SMA_Long"] = (
+        work["Close"].rolling(long).mean()
+    )
+
+    work["EMA_20"] = (
+        work["Close"].ewm(
+            span=20,
+            adjust=False
+        ).mean()
+    )
+
+    # Signal known at the end of each trading day
+    work["Raw_Signal"] = (
+        work["SMA_Short"] >
+        work["SMA_Long"]
+    ).astype(int)
+
+    # Position executed at the next day's opening price
+    work["Position"] = (
+        work["Raw_Signal"]
+        .shift(1)
+        .fillna(0)
+        .astype(int)
+    )
+
+    # Next-day Open price
+    work["Next_Open"] = work["Open"].shift(-1)
+
+    # Open-to-next-open return
+    work["Market_Return"] = (
+        work["Next_Open"] / work["Open"]
+    ) - 1
+
+    # Remove rows without valid forward prices
+    work = work.dropna(
+        subset=[
+            "SMA_Short",
+            "SMA_Long",
+            "Next_Open",
+            "Market_Return"
+        ]
+    ).copy()
+
+    if len(work) < 10:
+        return None
+
+    # Position changes = entry or exit
+    work["Position_Change"] = (
+        work["Position"]
+        .diff()
+        .abs()
+        .fillna(work["Position"].abs())
+    )
+
+    # Gross strategy returns
+    work["Gross_Return"] = (
+        work["Position"] *
+        work["Market_Return"]
+    )
+
+    # Transaction cost
+    work["Transaction_Cost"] = (
+        work["Position_Change"] * cost
+    )
+
+    # Net strategy returns
+    work["Net_Return"] = (
+        work["Gross_Return"] -
+        work["Transaction_Cost"]
+    )
+
+    # Benchmark returns
+    work["Benchmark_Return"] = (
+        work["Market_Return"]
+    )
+
+    # Portfolio values
+    work["Strategy_Portfolio"] = (
+        capital *
+        (1 + work["Net_Return"]).cumprod()
+    )
+
+    work["Benchmark_Portfolio"] = (
+        capital *
+        (1 + work["Benchmark_Return"]).cumprod()
+    )
+
+    # Drawdown including initial capital as starting peak
+    work["Portfolio_Peak"] = (
+        work["Strategy_Portfolio"]
+        .cummax()
+        .clip(lower=capital)
+    )
+
+    work["Drawdown"] = (
+        work["Strategy_Portfolio"] /
+        work["Portfolio_Peak"]
+    ) - 1
+
+    # Signal labels
+    previous_position = (
+        work["Position"].shift(1).fillna(0)
+    )
+
+    work["Signal"] = np.select(
+        [
+            (work["Position"] == 1) &
+            (previous_position == 0),
+
+            (work["Position"] == 0) &
+            (previous_position == 1)
+        ],
+        ["BUY", "SELL"],
+        default="HOLD"
+    )
+
+    return work
+
+
+# ============================================================
+# 4. PERFORMANCE METRICS
+# ============================================================
+
+def compute_metrics(work, capital=INITIAL_CAPITAL):
+
+    if work is None or len(work) == 0:
+        return None
+
+    returns = work["Net_Return"].dropna()
+
+    portfolio = work["Strategy_Portfolio"]
+
+    if len(returns) == 0:
+        return None
+
+    final_value = portfolio.iloc[-1]
+
+    total_return = (
+        final_value / capital - 1
+    ) * 100
+
+    years = len(returns) / 252
+
+    if years > 0 and final_value > 0:
+
+        cagr = (
+            (final_value / capital) ** (1 / years) - 1
+        ) * 100
+
+    else:
+        cagr = np.nan
+
+    volatility = returns.std()
+
+    if volatility > 0:
+
+        sharpe = (
+            returns.mean() /
+            volatility
+        ) * np.sqrt(252)
+
+    else:
+        sharpe = np.nan
+
+    max_drawdown = (
+        work["Drawdown"].min() * 100
+    )
+
+    benchmark_value = (
+        work["Benchmark_Portfolio"].iloc[-1]
+    )
+
+    benchmark_return = (
+        benchmark_value / capital - 1
+    ) * 100
+
+    return {
+
+        "Total_Return_Pct": round(total_return, 2),
+
+        "CAGR_Pct": round(cagr, 2)
+        if np.isfinite(cagr) else np.nan,
+
+        "Sharpe": round(sharpe, 3)
+        if np.isfinite(sharpe) else np.nan,
+
+        "Max_Drawdown_Pct": round(max_drawdown, 2),
+
+        "Volatility_Pct": round(
+            volatility * np.sqrt(252) * 100, 2
+        ),
+
+        "Benchmark_Return_Pct": round(
+            benchmark_return, 2
+        ),
+
+        "Final_Portfolio_Value": round(
+            final_value, 2
+        )
+    }
+
+
+# ============================================================
+# 5. TRADE EXTRACTION
+# ============================================================
+
+TRADE_COLUMNS = [
+    "Ticker",
+    "Entry_Date",
+    "Exit_Date",
+    "Entry_Price",
+    "Exit_Price",
+    "Gross_Return",
+    "Net_Return",
+    "Win"
+]
+
+
+def extract_trades(work, ticker, cost=COST_PER_SIDE):
+
+    trades = []
+
+    if work is None or work.empty:
+        return trades
+
+    in_trade = False
+
+    entry_date = None
+    entry_price = None
+
+    for i in range(len(work)):
+
+        position = int(work["Position"].iloc[i])
+
+        current_date = work.index[i]
+        current_price = float(work["Open"].iloc[i])
+
+        if position == 1 and not in_trade:
+
+            entry_date = current_date
+            entry_price = current_price
+
+            in_trade = True
+
+        elif position == 0 and in_trade:
+
+            exit_date = current_date
+            exit_price = current_price
+
+            gross = (
+                exit_price / entry_price
+            ) - 1
+
+            net = (
+                exit_price * (1 - cost)
+            ) / (
+                entry_price * (1 + cost)
+            ) - 1
+
+            trades.append({
+
+                "Ticker": ticker,
+
+                "Entry_Date": entry_date,
+
+                "Exit_Date": exit_date,
+
+                "Entry_Price": entry_price,
+
+                "Exit_Price": exit_price,
+
+                "Gross_Return": gross,
+
+                "Net_Return": net,
+
+                "Win": bool(net > 0)
+            })
+
+            in_trade = False
+
+    # Close any remaining position at the last available
+    # next-day opening price used in the backtest.
+
+    if in_trade:
+
+        exit_date = work.index[-1] + pd.Timedelta(days=1)
+
+        exit_price = float(work["Next_Open"].iloc[-1])
+
+        gross = (
+            exit_price / entry_price
+        ) - 1
+
+        net = (
+            exit_price * (1 - cost)
+        ) / (
+            entry_price * (1 + cost)
+        ) - 1
+
+        trades.append({
+
+            "Ticker": ticker,
+
+            "Entry_Date": entry_date,
+
+            "Exit_Date": exit_date,
+
+            "Entry_Price": entry_price,
+
+            "Exit_Price": exit_price,
+
+            "Gross_Return": gross,
+
+            "Net_Return": net,
+
+            "Win": bool(net > 0)
+        })
+
+    return trades
+
+
+# ============================================================
+# 6. MULTI-STOCK BACKTEST
+# ============================================================
+
+print("\n" + "=" * 65)
+print("MULTI-STOCK ALGORITHMIC BACKTEST")
+print("=" * 65)
+
+all_results = []
+all_trades = []
+all_works = {}
+all_test_works = {}
+
+for ticker in TICKERS:
+
+    print("\nProcessing:", ticker)
+
+    data = download_data(ticker)
+
+    if data.empty:
+
+        print("Skipped: No historical data")
+        continue
+
+    print(
+        "Rows:",
+        len(data),
+        "| Start:",
+        data.index[0].date(),
+        "| End:",
+        data.index[-1].date()
+    )
+
+    # Split raw data chronologically
+    split = int(len(data) * TRAIN_SPLIT)
+
+    if split <= LONG_WINDOW or len(data) - split < 30:
+
+        print("Skipped: Insufficient train/test observations")
+        continue
+
+    # Calculate features using historical information.
+    # Test indicators retain the training-period warm-up.
+    full_work = backtest_ma(
+        data,
+        SHORT_WINDOW,
+        LONG_WINDOW,
+        INITIAL_CAPITAL,
+        COST_PER_SIDE
+    )
+
+    if full_work is None:
+
+        print("Skipped: Full backtest failed")
+        continue
+
+    # Split using the original date boundary
+    split_date = data.index[split]
+
+    train_work = full_work[
+        full_work.index < split_date
+    ].copy()
+
+    test_work = full_work[
+        full_work.index >= split_date
+    ].copy()
+
+    if len(train_work) < 10 or len(test_work) < 10:
+
+        print("Skipped: Insufficient backtest rows")
+        continue
+
+    # Rebuild portfolios separately.
+    # Test starts with fresh capital and charges an entry
+    # cost if a position is active on its first test day.
+
+    def reset_portfolio(work):
+
+        work = work.copy()
+
+        work["Position_Change"] = (
+            work["Position"]
+            .diff()
+            .abs()
+            .fillna(work["Position"].abs())
+        )
+
+        work["Transaction_Cost"] = (
+            work["Position_Change"] * COST_PER_SIDE
+        )
+
+        work["Net_Return"] = (
+            work["Gross_Return"] -
+            work["Transaction_Cost"]
+        )
+
+        work["Strategy_Portfolio"] = (
+            INITIAL_CAPITAL *
+            (1 + work["Net_Return"]).cumprod()
+        )
+
+        work["Benchmark_Portfolio"] = (
+            INITIAL_CAPITAL *
+            (1 + work["Benchmark_Return"]).cumprod()
+        )
+
+        work["Portfolio_Peak"] = (
+            work["Strategy_Portfolio"]
+            .cummax()
+            .clip(lower=INITIAL_CAPITAL)
+        )
+
+        work["Drawdown"] = (
+            work["Strategy_Portfolio"] /
+            work["Portfolio_Peak"]
+        ) - 1
+
+        return work
+
+    train_work = reset_portfolio(train_work)
+
+    test_work = reset_portfolio(test_work)
+
+    full_m = compute_metrics(full_work)
+
+    train_m = compute_metrics(train_work)
+
+    test_m = compute_metrics(test_work)
+
+    if full_m is None or train_m is None or test_m is None:
+
+        print("Skipped: Metrics unavailable")
+        continue
+
+    all_works[ticker] = full_work
+
+    all_test_works[ticker] = test_work
+
+    # Save metrics
+    all_results.append({
+
+        "Ticker": ticker,
+
+        "Full_Return_Pct": full_m["Total_Return_Pct"],
+
+        "Full_Sharpe": full_m["Sharpe"],
+
+        "Full_Max_DD_Pct": full_m["Max_Drawdown_Pct"],
+
+        "Full_Benchmark_Return_Pct":
+            full_m["Benchmark_Return_Pct"],
+
+        "Train_Return_Pct": train_m["Total_Return_Pct"],
+
+        "Train_Sharpe": train_m["Sharpe"],
+
+        "Train_Benchmark_Return_Pct":
+            train_m["Benchmark_Return_Pct"],
+
+        "Test_Return_Pct": test_m["Total_Return_Pct"],
+
+        "Test_Sharpe": test_m["Sharpe"],
+
+        "Test_Max_DD_Pct": test_m["Max_Drawdown_Pct"],
+
+        "Test_Benchmark_Return_Pct":
+            test_m["Benchmark_Return_Pct"]
+
+    })
+
+    all_trades.extend(
+        extract_trades(
+            full_work,
+            ticker,
+            COST_PER_SIDE
+        )
+    )
+
+    print(
+        "Full Return:",
+        full_m["Total_Return_Pct"], "%"
+    )
+
+    print(
+        "Train Return:",
+        train_m["Total_Return_Pct"], "%"
+    )
+
+    print(
+        "Test Return:",
+        test_m["Total_Return_Pct"], "%"
+    )
+
+    print(
+        "Test Sharpe:",
+        test_m["Sharpe"]
+    )
+
+
+# ============================================================
+# 7. RESULTS TABLES
+# ============================================================
+
+RESULT_COLUMNS = [
+    "Ticker",
+    "Full_Return_Pct",
+    "Full_Sharpe",
+    "Full_Max_DD_Pct",
+    "Full_Benchmark_Return_Pct",
+    "Train_Return_Pct",
+    "Train_Sharpe",
+    "Train_Benchmark_Return_Pct",
+    "Test_Return_Pct",
+    "Test_Sharpe",
+    "Test_Max_DD_Pct",
+    "Test_Benchmark_Return_Pct"
+]
+
+results_df = pd.DataFrame(
+    all_results,
+    columns=RESULT_COLUMNS
+)
+
+trades_df = pd.DataFrame(
+    all_trades,
+    columns=TRADE_COLUMNS
+)
+
+print("\n" + "=" * 65)
+print("MULTI-STOCK RESULTS")
+print("=" * 65)
+
+if not results_df.empty:
+
+    display(results_df.round(3))
+
+    print("\nAVERAGE RESULTS")
+
+    print(
+        "Average Full Return:",
+        round(results_df["Full_Return_Pct"].mean(), 2),
+        "%"
+    )
+
+    print(
+        "Average Test Return:",
+        round(results_df["Test_Return_Pct"].mean(), 2),
+        "%"
+    )
+
+    print(
+        "Average Test Sharpe:",
+        round(results_df["Test_Sharpe"].mean(), 3)
+    )
+
+else:
+
+    print("No stocks successfully processed.")
+
+print("\nTRADE LOG")
+
+print("Total trades:", len(trades_df))
+
+if not trades_df.empty:
+
+    print(
+        "Win Rate:",
+        round(trades_df["Win"].mean() * 100, 2),
+        "%"
+    )
+
+    display(trades_df.head(10))
+
+
+# ============================================================
+# 8. TRADE-LEVEL METRICS
+# ============================================================
+
+if len(trades_df) > 0:
+
+    winning_returns = trades_df.loc[
+        trades_df["Net_Return"] > 0,
+        "Net_Return"
+    ]
+
+    losing_returns = trades_df.loc[
+        trades_df["Net_Return"] < 0,
+        "Net_Return"
+    ]
+
+    gross_profit = winning_returns.sum()
+
+    gross_loss = abs(losing_returns.sum())
+
+    profit_factor = (
+        gross_profit / gross_loss
+        if gross_loss > 0 else np.inf
+    )
+
+    trade_metrics = pd.DataFrame({
+
+        "Metric": [
+            "Total Trades",
+            "Winning Trades",
+            "Losing Trades",
+            "Win Rate (%)",
+            "Average Trade Return (%)",
+            "Profit Factor"
+        ],
+
+        "Value": [
+
+            len(trades_df),
+
+            int(trades_df["Win"].sum()),
+
+            int((~trades_df["Win"]).sum()),
+
+            round(trades_df["Win"].mean() * 100, 2),
+
+            round(trades_df["Net_Return"].mean() * 100, 4),
+
+            round(profit_factor, 3)
+        ]
+    })
+
+else:
+
+    trade_metrics = pd.DataFrame({
+
+        "Metric": [
+            "Total Trades",
+            "Winning Trades",
+            "Losing Trades",
+            "Win Rate (%)",
+            "Average Trade Return (%)",
+            "Profit Factor"
+        ],
+
+        "Value": [0, 0, 0, 0, 0, np.nan]
+    })
+
+print("\nTRADE PERFORMANCE METRICS")
+
+display(trade_metrics)
+
+
+# ============================================================
+# 9. SQL DATABASE
+# ============================================================
+
+print("\n" + "=" * 65)
+print("SQL DATABASE AND QUERIES")
+print("=" * 65)
+
+conn = sqlite3.connect(DATABASE)
+
+try:
+
+    results_df.to_sql(
+        "multi_ticker_results",
+        conn,
+        if_exists="replace",
+        index=False
+    )
+
+    trades_df.to_sql(
+        "trade_log",
+        conn,
+        if_exists="replace",
+        index=False
+    )
+
+    trade_metrics.to_sql(
+        "trade_metrics",
+        conn,
+        if_exists="replace",
+        index=False
+    )
+
+    # Save complete backtest results for each stock
+    for ticker, work in all_works.items():
+
+        safe_name = (
+            ticker.replace(".", "_")
+                  .replace("-", "_")
+                  .lower()
+        )
+
+        work.reset_index().rename(
+            columns={"index": "Date"}
+        ).to_sql(
+            safe_name,
+            conn,
+            if_exists="replace",
+            index=False
+        )
+
+    print("Database created successfully!")
+
+    # QUERY 1
+    print("\nSQL QUERY 1: STOCK PERFORMANCE")
+
+    q1 = pd.read_sql_query("""
+        SELECT
+            Ticker,
+            Full_Return_Pct,
+            Full_Sharpe,
+            Test_Return_Pct,
+            Test_Sharpe
+        FROM multi_ticker_results
+        ORDER BY Test_Sharpe DESC
+    """, conn)
+
+    display(q1)
+
+    # QUERY 2
+    print("\nSQL QUERY 2: OVERALL TRADE SUMMARY")
+
+    q2 = pd.read_sql_query("""
+        SELECT
+            COUNT(*) AS Total_Trades,
+
+            SUM(
+                CASE WHEN Win = 1 THEN 1 ELSE 0 END
+            ) AS Winning_Trades,
+
+            SUM(
+                CASE WHEN Win = 0 THEN 1 ELSE 0 END
+            ) AS Losing_Trades,
+
+            ROUND(
+                AVG(Net_Return) * 100, 4
+            ) AS Average_Trade_Return_Pct
+
+        FROM trade_log
+    """, conn)
+
+    display(q2)
+
+    # QUERY 3
+    print("\nSQL QUERY 3: TICKER-WISE TRADE ANALYSIS")
+
+    q3 = pd.read_sql_query("""
+        SELECT
+            Ticker,
+
+            COUNT(*) AS Total_Trades,
+
+            SUM(
+                CASE WHEN Win = 1 THEN 1 ELSE 0 END
+            ) AS Wins,
+
+            ROUND(
+                AVG(Net_Return) * 100, 3
+            ) AS Average_Return_Pct
+
+        FROM trade_log
+
+        GROUP BY Ticker
+
+        ORDER BY Total_Trades DESC
+    """, conn)
+
+    display(q3)
+
+finally:
+
+    conn.close()
+
+
+# ============================================================
+# 10. CHART 1: EQUITY CURVES
+# ============================================================
+
+if all_works:
+
+    plt.figure(figsize=(14, 6))
+
+    for ticker, work in all_works.items():
+
+        plt.plot(
+            work.index,
+            work["Strategy_Portfolio"],
+            label=ticker
+        )
+
+    plt.title("Strategy Equity Curves - All NSE Stocks")
+
+    plt.xlabel("Date")
+
+    plt.ylabel("Portfolio Value")
+
+    plt.legend()
+
+    plt.grid(alpha=0.3)
+
+    plt.tight_layout()
+
+    plt.show()
+
+
+# ============================================================
+# 11. CHART 2: STRATEGY VS BENCHMARK
+# ============================================================
+
+if all_works:
+
+    for ticker, work in all_works.items():
+
+        plt.figure(figsize=(12, 5))
+
+        plt.plot(
+            work.index,
+            work["Strategy_Portfolio"],
+            label="MA Strategy"
+        )
+
+        plt.plot(
+            work.index,
+            work["Benchmark_Portfolio"],
+            label="Buy and Hold"
+        )
+
+        plt.title(
+            f"{ticker} - Strategy vs Buy and Hold"
+        )
+
+        plt.xlabel("Date")
+
+        plt.ylabel("Portfolio Value")
+
+        plt.legend()
+
+        plt.grid(alpha=0.3)
+
+        plt.tight_layout()
+
+        plt.show()
+
+
+# ============================================================
+# 12. CHART 3: TRAIN VS TEST SHARPE
+# ============================================================
+
+if not results_df.empty:
+
+    x = np.arange(len(results_df))
+
+    width = 0.35
+
+    plt.figure(figsize=(12, 5))
+
+    plt.bar(
+        x - width / 2,
+        results_df["Train_Sharpe"],
+        width,
+        label="Train"
+    )
+
+    plt.bar(
+        x + width / 2,
+        results_df["Test_Sharpe"],
+        width,
+        label="Test"
+    )
+
+    plt.xticks(
+        x,
+        results_df["Ticker"]
+    )
+
+    plt.title("Train vs Test Sharpe Ratio")
+
+    plt.ylabel("Sharpe Ratio")
+
+    plt.axhline(0, linewidth=0.8)
+
+    plt.legend()
+
+    plt.grid(axis="y", alpha=0.3)
+
+    plt.tight_layout()
+
+    plt.show()
+
+
+# ============================================================
+# 13. CHART 4: DRAWDOWN
+# ============================================================
+
+if all_works:
+
+    plt.figure(figsize=(14, 5))
+
+    for ticker, work in all_works.items():
+
+        plt.plot(
+            work.index,
+            work["Drawdown"] * 100,
+            label=ticker
+        )
+
+    plt.title("Portfolio Drawdown Comparison")
+
+    plt.xlabel("Date")
+
+    plt.ylabel("Drawdown (%)")
+
+    plt.legend()
+
+    plt.grid(alpha=0.3)
+
+    plt.tight_layout()
+
+    plt.show()
+
+
+# ============================================================
+# 14. CSV EXPORTS
+# ============================================================
+
+results_df.to_csv(
+    "multi_ticker_results.csv",
+    index=False
+)
+
+trades_df.to_csv(
+    "trade_log.csv",
+    index=False
+)
+
+trade_metrics.to_csv(
+    "trade_metrics.csv",
+    index=False
+)
+
+# Export individual stock backtest data
+for ticker, work in all_works.items():
+
+    safe_name = (
+        ticker.replace(".", "_")
+              .replace("-", "_")
+              .lower()
+    )
+
+    work.to_csv(
+        f"{safe_name}_backtest.csv"
+    )
+
+print("\nCSV exports completed!")
+
+
+# ============================================================
+# 15. VERIFY OUTPUT FILES
+# ============================================================
+
+output_files = [
+
+    "multi_ticker_results.csv",
+
+    "trade_log.csv",
+
+    "trade_metrics.csv",
+
+    DATABASE
+]
+
+for ticker in all_works:
+
+    safe_name = (
+        ticker.replace(".", "_")
+              .replace("-", "_")
+              .lower()
+    )
+
+    output_files.append(
+        f"{safe_name}_backtest.csv"
+    )
+
+print("\nFILE VERIFICATION")
+
+for file in output_files:
+
+    if os.path.exists(file):
+
+        print("✓", file)
+
+    else:
+
+        print("MISSING:", file)
+
+
+# ============================================================
+# 16. FINAL PROJECT REPORT
+# ============================================================
+
+print("\n" + "=" * 65)
+print("ALGORITHMIC TRADING BACKTESTER - FINAL REPORT")
+print("=" * 65)
+
+print("Stocks processed:", len(all_works))
+
+print("Initial Capital per Stock:", INITIAL_CAPITAL)
+
+print("SMA Configuration:", SHORT_WINDOW, "/", LONG_WINDOW)
+
+print("Transaction Cost:", COST_PER_SIDE * 10000, "bps per side")
+
+print("Total Trades:", len(trades_df))
+
+if not results_df.empty:
+
+    print(
+        "Average Full Return:",
+        round(results_df["Full_Return_Pct"].mean(), 2),
+        "%"
+    )
+
+    print(
+        "Average Test Return:",
+        round(results_df["Test_Return_Pct"].mean(), 2),
+        "%"
+    )
+
+    print(
+        "Average Test Sharpe:",
+        round(results_df["Test_Sharpe"].mean(), 3)
+    )
+
+print("\nDatabase:", DATABASE)
+
+print("Execution completed successfully!")
+
+print("=" * 65)

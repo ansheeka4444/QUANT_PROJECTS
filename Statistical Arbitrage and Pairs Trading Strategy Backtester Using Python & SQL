@@ -1,0 +1,742 @@
+
+# ============================================================
+# PROJECT 3: STATISTICAL ARBITRAGE / PAIRS TRADING
+# Python | Pandas | NumPy | SQL | Statistical Analysis
+# RELIANCE.NS vs ONGC.NS
+# ============================================================
+
+%pip install -q pandas numpy matplotlib yfinance statsmodels
+
+import os
+import sqlite3
+import warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import yfinance as yf
+
+from statsmodels.tsa.stattools import coint
+
+warnings.filterwarnings("ignore")
+
+# ============================================================
+# 1. CONFIGURATION
+# ============================================================
+
+TICKER_A = "RELIANCE.NS"
+TICKER_B = "ONGC.NS"
+
+START_DATE = "2021-01-01"
+END_DATE = "2026-11-01"
+
+INITIAL_CAPITAL = 100000
+
+ENTRY_Z = 2.0
+EXIT_Z = 0.0
+STOP_Z = 3.5
+
+ROLLING_WINDOW = 30
+TRANSACTION_COST_BPS = 10
+
+TRAIN_RATIO = 0.70
+
+DB_NAME = "pairs_trading.db"
+
+print("=" * 55)
+print("STATISTICAL ARBITRAGE / PAIRS TRADING")
+print("=" * 55)
+
+# ============================================================
+# 2. DOWNLOAD STOCK DATA
+# ============================================================
+
+def download_stock(ticker):
+
+    data = yf.download(
+        ticker,
+        start=START_DATE,
+        end=END_DATE,
+        auto_adjust=True,
+        progress=False
+    )
+
+    if data.empty:
+        raise ValueError(f"Unable to download data for {ticker}")
+
+    if isinstance(data.columns, pd.MultiIndex):
+        close = data["Close"].iloc[:, 0]
+    else:
+        close = data["Close"]
+
+    return pd.to_numeric(close, errors="coerce").rename(ticker)
+
+
+print("\nDownloading stock data...")
+
+stock_a = download_stock(TICKER_A)
+stock_b = download_stock(TICKER_B)
+
+prices = pd.concat([stock_a, stock_b], axis=1)
+prices.columns = ["Price_A", "Price_B"]
+
+prices = prices.dropna()
+prices = prices[
+    (prices["Price_A"] > 0) &
+    (prices["Price_B"] > 0)
+]
+
+prices = prices.sort_index()
+prices = prices[~prices.index.duplicated(keep="last")]
+
+if len(prices) < 100:
+    raise ValueError("Insufficient historical data.")
+
+print("Data downloaded successfully.")
+print("Total observations:", len(prices))
+print("Start date:", prices.index.min())
+print("End date:", prices.index.max())
+
+# ============================================================
+# 3. TRAIN / TEST SPLIT
+# ============================================================
+
+split_index = int(len(prices) * TRAIN_RATIO)
+
+train = prices.iloc[:split_index].copy()
+test = prices.iloc[split_index:].copy()
+
+print("\nTraining observations:", len(train))
+print("Testing observations:", len(test))
+
+# ============================================================
+# 4. CORRELATION AND COINTEGRATION
+# ============================================================
+
+correlation = train["Price_A"].corr(train["Price_B"])
+
+coint_stat, coint_pvalue, critical_values = coint(
+    train["Price_A"],
+    train["Price_B"]
+)
+
+print("\nCorrelation:", round(correlation, 4))
+print("Cointegration p-value:", round(coint_pvalue, 6))
+
+if coint_pvalue < 0.05:
+    print("Decision: Evidence of cointegration at 5%.")
+else:
+    print("Decision: Pair NOT validated at 5% significance.")
+
+# ============================================================
+# 5. OLS HEDGE RATIO
+# ============================================================
+
+# Estimate parameters using training data only.
+
+X = np.column_stack([
+    np.ones(len(train)),
+    train["Price_B"].values
+])
+
+y = train["Price_A"].values
+
+alpha, hedge_ratio = np.linalg.lstsq(
+    X, y, rcond=None
+)[0]
+
+train_spread = (
+    train["Price_A"] -
+    alpha -
+    hedge_ratio * train["Price_B"]
+)
+
+r_squared = 1 - (
+    np.sum(train_spread ** 2) /
+    np.sum((train["Price_A"] - train["Price_A"].mean()) ** 2)
+)
+
+print("\nOLS Model")
+print("Alpha:", round(alpha, 4))
+print("Hedge Ratio:", round(hedge_ratio, 4))
+print("R-squared:", round(r_squared, 4))
+
+# ============================================================
+# 6. OU HALF-LIFE
+# ============================================================
+
+spread_lag = train_spread.shift(1)
+spread_change = train_spread.diff()
+
+ou_data = pd.concat(
+    [spread_change, spread_lag],
+    axis=1
+).dropna()
+
+ou_X = np.column_stack([
+    np.ones(len(ou_data)),
+    ou_data.iloc[:, 1].values
+])
+
+ou_y = ou_data.iloc[:, 0].values
+
+ou_intercept, theta = np.linalg.lstsq(
+    ou_X, ou_y, rcond=None
+)[0]
+
+if -1 < theta < 0:
+    half_life = -np.log(2) / np.log(1 + theta)
+else:
+    half_life = np.nan
+
+print("\nOU Mean Reversion")
+print("Theta:", round(theta, 6))
+print("Estimated Half-Life:", round(half_life, 2)
+      if np.isfinite(half_life) else "Not available")
+
+# ============================================================
+# 7. SPREAD AND Z-SCORE
+# ============================================================
+
+df = prices.copy()
+
+df["Spread"] = (
+    df["Price_A"] -
+    alpha -
+    hedge_ratio * df["Price_B"]
+)
+
+df["Spread_Mean"] = df["Spread"].rolling(
+    ROLLING_WINDOW
+).mean()
+
+df["Spread_Std"] = df["Spread"].rolling(
+    ROLLING_WINDOW
+).std()
+
+df["Z_Score"] = (
+    (df["Spread"] - df["Spread_Mean"]) /
+    df["Spread_Std"].replace(0, np.nan)
+)
+
+df["Z_Score"] = df["Z_Score"].replace(
+    [np.inf, -np.inf], np.nan
+)
+
+# ============================================================
+# 8. TRADING SIGNALS
+# ============================================================
+
+# +1 = Long spread
+# -1 = Short spread
+#  0 = Neutral
+
+def generate_signals(z_scores):
+
+    signals = []
+    position = 0
+
+    for z in z_scores:
+
+        if pd.isna(z):
+            position = 0
+
+        elif position != 0 and abs(z) >= STOP_Z:
+            position = 0
+
+        elif position != 0 and abs(z) <= EXIT_Z:
+            position = 0
+
+        elif position == 0:
+
+            if z >= ENTRY_Z:
+                position = -1
+
+            elif z <= -ENTRY_Z:
+                position = 1
+
+        signals.append(position)
+
+    return pd.Series(
+        signals,
+        index=z_scores.index,
+        dtype=float
+    )
+
+
+df["Target_Position"] = generate_signals(df["Z_Score"])
+
+# Execute signal on the following trading day.
+df["Position"] = (
+    df["Target_Position"].shift(1).fillna(0)
+)
+
+# ============================================================
+# 9. STRATEGY RETURNS
+# ============================================================
+
+df["Price_A_Change"] = df["Price_A"].diff()
+df["Price_B_Change"] = df["Price_B"].diff()
+
+gross_notional = (
+    df["Price_A"].shift(1) +
+    abs(hedge_ratio) * df["Price_B"].shift(1)
+)
+
+df["Pair_Return"] = (
+    df["Price_A_Change"] -
+    hedge_ratio * df["Price_B_Change"]
+) / gross_notional.replace(0, np.nan)
+
+df["Pair_Return"] = df["Pair_Return"].replace(
+    [np.inf, -np.inf], np.nan
+).fillna(0)
+
+df["Gross_Return"] = (
+    df["Position"] * df["Pair_Return"]
+)
+
+# ============================================================
+# 10. TRANSACTION COSTS
+# ============================================================
+
+cost_rate = TRANSACTION_COST_BPS / 10000
+
+df["Turnover"] = df["Position"].diff().abs()
+
+df.iloc[
+    0, df.columns.get_loc("Turnover")
+] = abs(df["Position"].iloc[0])
+
+df["Transaction_Cost"] = (
+    df["Turnover"] * cost_rate
+)
+
+df["Net_Return"] = (
+    df["Gross_Return"] -
+    df["Transaction_Cost"]
+)
+
+# ============================================================
+# 11. PORTFOLIO AND DRAWDOWN
+# ============================================================
+
+df["Portfolio_Value"] = (
+    INITIAL_CAPITAL *
+    (1 + df["Net_Return"]).cumprod()
+)
+
+df["Peak"] = df["Portfolio_Value"].cummax()
+
+df["Drawdown"] = (
+    df["Portfolio_Value"] / df["Peak"] - 1
+)
+
+# ============================================================
+# 12. PERFORMANCE METRICS
+# ============================================================
+
+def performance_metrics(returns, name):
+
+    returns = pd.Series(returns).dropna()
+
+    if len(returns) == 0:
+        return {
+            "Period": name,
+            "Total Return (%)": np.nan,
+            "CAGR (%)": np.nan,
+            "Sharpe Ratio": np.nan,
+            "Max Drawdown (%)": np.nan
+        }
+
+    equity = (1 + returns).cumprod()
+
+    total_return = equity.iloc[-1] - 1
+
+    years = len(returns) / 252
+
+    cagr = (
+        equity.iloc[-1] ** (1 / years) - 1
+        if years > 0 and equity.iloc[-1] > 0
+        else np.nan
+    )
+
+    volatility = returns.std()
+
+    sharpe = (
+        returns.mean() / volatility * np.sqrt(252)
+        if volatility > 0 else np.nan
+    )
+
+    drawdown = equity / equity.cummax() - 1
+
+    return {
+        "Period": name,
+        "Total Return (%)": total_return * 100,
+        "CAGR (%)": cagr * 100,
+        "Sharpe Ratio": sharpe,
+        "Max Drawdown (%)": drawdown.min() * 100
+    }
+
+
+metrics = pd.DataFrame([
+    performance_metrics(
+        df.loc[train.index, "Net_Return"],
+        "Training"
+    ),
+    performance_metrics(
+        df.loc[test.index, "Net_Return"],
+        "Testing"
+    ),
+    performance_metrics(
+        df["Net_Return"],
+        "Overall"
+    )
+])
+
+print("\n" + "=" * 55)
+print("PERFORMANCE RESULTS")
+print("=" * 55)
+
+print(metrics.round(4).to_string(index=False))
+
+# ============================================================
+# 13. CORRECTED TRADE LOG
+# ============================================================
+
+trades = []
+
+current_trade = None
+previous_position = 0
+previous_date = None
+
+for date, row in df.iterrows():
+
+    position = int(row["Position"])
+
+    if position != previous_position:
+
+        # Close previous trade
+        if current_trade is not None:
+
+            current_trade["Exit_Signal_Date"] = previous_date
+            current_trade["Exit_Date"] = date
+
+            current_trade["Exit_Z"] = (
+                df.loc[previous_date, "Z_Score"]
+                if previous_date is not None else np.nan
+            )
+
+            current_trade["Status"] = "CLOSED"
+
+            trades.append(current_trade)
+            current_trade = None
+
+        # Open new trade
+        if position != 0:
+
+            signal_date = previous_date
+
+            signal_z = (
+                df.loc[signal_date, "Z_Score"]
+                if signal_date is not None else np.nan
+            )
+
+            current_trade = {
+                "Trade_ID": len(trades) + 1,
+                "Direction": (
+                    "LONG_SPREAD" if position == 1
+                    else "SHORT_SPREAD"
+                ),
+                "Signal_Date": signal_date,
+                "Entry_Date": date,
+                "Entry_Z": signal_z,
+                "Exit_Signal_Date": None,
+                "Exit_Date": None,
+                "Exit_Z": np.nan,
+                "Trade_Return": 0.0,
+                "Status": "OPEN"
+            }
+
+    # Accumulate the return on the currently active trade.
+    if current_trade is not None:
+
+        current_trade["Trade_Return"] = (
+            (1 + current_trade["Trade_Return"]) *
+            (1 + row["Net_Return"]) - 1
+        )
+
+    previous_position = position
+    previous_date = date
+
+
+if current_trade is not None:
+
+    current_trade["Status"] = "OPEN_AT_END"
+    trades.append(current_trade)
+
+
+trades_df = pd.DataFrame(trades)
+
+if not trades_df.empty:
+
+    trades_df["Trade_Return_Pct"] = (
+        trades_df["Trade_Return"] * 100
+    )
+
+    closed = trades_df[
+        trades_df["Status"] == "CLOSED"
+    ]
+
+    if len(closed) > 0:
+
+        win_rate = (
+            (closed["Trade_Return"] > 0).mean() * 100
+        )
+
+        positive = closed.loc[
+            closed["Trade_Return"] > 0,
+            "Trade_Return"
+        ].sum()
+
+        negative = abs(
+            closed.loc[
+                closed["Trade_Return"] < 0,
+                "Trade_Return"
+            ].sum()
+        )
+
+        profit_factor = (
+            positive / negative if negative > 0
+            else np.inf
+        )
+
+    else:
+        win_rate = np.nan
+        profit_factor = np.nan
+
+else:
+    win_rate = np.nan
+    profit_factor = np.nan
+
+print("\nTotal trade episodes:", len(trades_df))
+print("Closed trade win rate:", round(win_rate, 2))
+print("Closed trade profit factor:", round(profit_factor, 4))
+
+if not trades_df.empty:
+    print("\nTrade Log:")
+    print(
+        trades_df[
+            [
+                "Trade_ID",
+                "Direction",
+                "Signal_Date",
+                "Entry_Date",
+                "Entry_Z",
+                "Exit_Date",
+                "Exit_Z",
+                "Trade_Return_Pct",
+                "Status"
+            ]
+        ].head(10).round(4).to_string(index=False)
+    )
+
+# ============================================================
+# 14. FINAL CAPITAL
+# ============================================================
+
+final_value = df["Portfolio_Value"].iloc[-1]
+
+print("\nInitial Capital: ₹", INITIAL_CAPITAL)
+print("Final Strategy Value: ₹", round(final_value, 2))
+print("Cash Baseline: ₹", INITIAL_CAPITAL)
+
+print(
+    "Note: Cash baseline is only a capital reference, "
+    "not a risk-matched benchmark."
+)
+
+# ============================================================
+# 15. EXPORT CSV FILES
+# ============================================================
+
+df.to_csv("pair_signals.csv")
+prices.to_csv("stock_prices.csv")
+metrics.to_csv("performance_metrics.csv", index=False)
+trades_df.to_csv("trade_log.csv", index=False)
+
+print("\nCSV files exported successfully.")
+
+# ============================================================
+# 16. SQLITE DATABASE - ONLY THREE TABLES
+# ============================================================
+
+# Remove old database to prevent stale tables.
+
+if os.path.exists(DB_NAME):
+    os.remove(DB_NAME)
+
+conn = sqlite3.connect(DB_NAME)
+
+prices.to_sql(
+    "stock_prices",
+    conn,
+    if_exists="replace",
+    index=True,
+    index_label="Date"
+)
+
+df.to_sql(
+    "pair_signals",
+    conn,
+    if_exists="replace",
+    index=True,
+    index_label="Date"
+)
+
+trades_df.to_sql(
+    "trade_log",
+    conn,
+    if_exists="replace",
+    index=False
+)
+
+# Verify tables
+
+tables = pd.read_sql_query(
+    """
+    SELECT name
+    FROM sqlite_master
+    WHERE type='table'
+    ORDER BY name
+    """,
+    conn
+)
+
+print("\nSQL Database Tables:")
+print(tables.to_string(index=False))
+
+conn.close()
+
+print("Database saved:", DB_NAME)
+
+# ============================================================
+# 17. CHART 1: SPREAD AND Z-SCORE
+# ============================================================
+
+fig, axes = plt.subplots(
+    2, 1,
+    figsize=(13, 8),
+    sharex=True
+)
+
+axes[0].plot(df.index, df["Spread"])
+axes[0].set_title("Pairs Trading Spread")
+axes[0].set_ylabel("Spread")
+axes[0].grid(alpha=0.3)
+
+axes[1].plot(
+    df.index,
+    df["Z_Score"],
+    label="Z-Score"
+)
+
+axes[1].axhline(ENTRY_Z, linestyle="--", label="Upper Entry")
+axes[1].axhline(-ENTRY_Z, linestyle="--", label="Lower Entry")
+axes[1].axhline(EXIT_Z, linestyle=":", label="Exit")
+
+axes[1].set_title("Rolling Z-Score")
+axes[1].legend()
+axes[1].grid(alpha=0.3)
+
+plt.tight_layout()
+plt.savefig("spread_zscore.png", dpi=150)
+plt.show()
+
+# ============================================================
+# 18. CHART 2: PORTFOLIO PERFORMANCE
+# ============================================================
+
+plt.figure(figsize=(13, 5))
+
+plt.plot(
+    df.index,
+    df["Portfolio_Value"],
+    label="Pairs Trading Strategy"
+)
+
+plt.axhline(
+    INITIAL_CAPITAL,
+    linestyle="--",
+    label="Initial Capital / Cash Reference"
+)
+
+plt.title("Portfolio Performance")
+plt.xlabel("Date")
+plt.ylabel("Portfolio Value (₹)")
+plt.legend()
+plt.grid(alpha=0.3)
+
+plt.tight_layout()
+plt.savefig("portfolio_performance.png", dpi=150)
+plt.show()
+
+# ============================================================
+# 19. CHART 3: DRAWDOWN
+# ============================================================
+
+plt.figure(figsize=(13, 4))
+
+plt.plot(
+    df.index,
+    df["Drawdown"] * 100,
+    label="Drawdown"
+)
+
+plt.title("Strategy Drawdown")
+plt.xlabel("Date")
+plt.ylabel("Drawdown (%)")
+plt.grid(alpha=0.3)
+plt.legend()
+
+plt.tight_layout()
+plt.savefig("strategy_drawdown.png", dpi=150)
+plt.show()
+
+# ============================================================
+# 20. FINAL RESEARCH CONCLUSION
+# ============================================================
+
+test_result = metrics[
+    metrics["Period"] == "Testing"
+].iloc[0]
+
+print("\n" + "=" * 55)
+print("FINAL RESEARCH CONCLUSION")
+print("=" * 55)
+
+print("Pair:", TICKER_A, "vs", TICKER_B)
+
+if coint_pvalue < 0.05:
+    print("Cointegration: Evidence at 5% significance.")
+else:
+    print("Cointegration: NOT validated at 5% significance.")
+
+print(
+    "Out-of-sample return:",
+    round(test_result["Total Return (%)"], 4), "%"
+)
+
+print(
+    "Out-of-sample Sharpe:",
+    round(test_result["Sharpe Ratio"], 4)
+)
+
+print("\nProject limitations:")
+print("- Daily historical data")
+print("- Fixed hedge ratio")
+print("- Simplified transaction costs")
+print("- No order-book execution model")
+print("- No latency or partial-fill simulation")
+
+print("\nPROJECT EXECUTED SUCCESSFULLY!")
+print("All CSV files, charts and SQL database are saved.")

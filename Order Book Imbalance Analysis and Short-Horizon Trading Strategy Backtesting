@@ -1,0 +1,1101 @@
+
+# ============================================================
+# PROJECT 1: ORDER BOOK IMBALANCE ANALYZER
+# HFT Research Prototype
+# Dataset: btc.parquet
+# ============================================================
+
+%pip install -q pandas numpy matplotlib pyarrow
+
+import os
+import sqlite3
+import warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+warnings.filterwarnings("ignore")
+
+pd.set_option("display.max_columns", 50)
+pd.set_option("display.width", 160)
+
+print("Libraries imported successfully!")
+
+
+# ============================================================
+# 1. CONFIGURATION
+# ============================================================
+
+FILE_PATH = "btc.parquet"
+
+OBI_THRESHOLD = 0.15
+POSITION_SIZE = 1
+
+FEE_BPS = 0
+SLIPPAGE_BPS = 0
+
+FORWARD_SECONDS = 30
+MATCH_TOLERANCE_SECONDS = 3
+
+OUTPUT_DB = "hft_project1.db"
+
+print("Configuration ready!")
+
+
+# ============================================================
+# 2. LOAD DATASET
+# ============================================================
+
+if not os.path.exists(FILE_PATH):
+    raise FileNotFoundError(
+        f"{FILE_PATH} not found.\n"
+        f"Current directory: {os.getcwd()}\n"
+        f"Available files: {os.listdir()}"
+    )
+
+df = pd.read_parquet(FILE_PATH)
+
+print("\nDataset loaded successfully!")
+print("Original shape:", df.shape)
+print("\nColumns:")
+print(df.columns.tolist())
+
+required_columns = [
+    "market_slug",
+    "coin",
+    "token_id",
+    "outcome",
+    "captured_at",
+    "bid_prices",
+    "bid_sizes",
+    "ask_prices",
+    "ask_sizes",
+    "best_bid",
+    "best_ask"
+]
+
+missing_columns = [
+    col for col in required_columns
+    if col not in df.columns
+]
+
+if missing_columns:
+    raise ValueError(
+        f"Missing required columns: {missing_columns}"
+    )
+
+display(df.head())
+
+
+# ============================================================
+# 3. EXTRACT ORDER BOOK DATA
+# ============================================================
+
+def convert_to_list(value):
+
+    if value is None:
+        return []
+
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+
+    if isinstance(value, (list, tuple)):
+        return list(value)
+
+    if hasattr(value, "as_py"):
+        converted = value.as_py()
+        return converted if isinstance(converted, list) else []
+
+    if hasattr(value, "to_pylist"):
+        return value.to_pylist()
+
+    return []
+
+
+def safe_first(value):
+
+    values = convert_to_list(value)
+
+    if not values:
+        return np.nan
+
+    try:
+        return float(values[0])
+    except (TypeError, ValueError):
+        return np.nan
+
+
+def safe_sum(value, levels=5):
+
+    values = convert_to_list(value)
+
+    try:
+        return sum(
+            float(x)
+            for x in values[:levels]
+            if x is not None
+        )
+    except (TypeError, ValueError):
+        return np.nan
+
+
+df["best_bid"] = pd.to_numeric(
+    df["best_bid"], errors="coerce"
+)
+
+df["best_ask"] = pd.to_numeric(
+    df["best_ask"], errors="coerce"
+)
+
+df["bid_size_1"] = df["bid_sizes"].apply(safe_first)
+df["ask_size_1"] = df["ask_sizes"].apply(safe_first)
+
+df["total_bid_depth"] = df["bid_sizes"].apply(
+    lambda x: safe_sum(x, 5)
+)
+
+df["total_ask_depth"] = df["ask_sizes"].apply(
+    lambda x: safe_sum(x, 5)
+)
+
+print("\nOrder book extraction completed!")
+
+
+# ============================================================
+# 4. DATA CLEANING
+# ============================================================
+
+df["captured_at"] = pd.to_datetime(
+    df["captured_at"],
+    utc=True,
+    errors="coerce"
+)
+
+if "market_end_at" in df.columns:
+    df["market_end_at"] = pd.to_datetime(
+        df["market_end_at"],
+        utc=True,
+        errors="coerce"
+    )
+
+numeric_columns = [
+    "best_bid",
+    "best_ask",
+    "bid_size_1",
+    "ask_size_1",
+    "total_bid_depth",
+    "total_ask_depth"
+]
+
+for col in numeric_columns:
+    df[col] = pd.to_numeric(
+        df[col], errors="coerce"
+    )
+
+df = df.dropna(
+    subset=[
+        "market_slug",
+        "token_id",
+        "captured_at",
+        "best_bid",
+        "best_ask",
+        "bid_size_1",
+        "ask_size_1",
+        "total_bid_depth",
+        "total_ask_depth"
+    ]
+).copy()
+
+df = df[
+    (df["best_bid"] > 0) &
+    (df["best_ask"] > 0) &
+    (df["best_ask"] >= df["best_bid"]) &
+    (df["bid_size_1"] >= 0) &
+    (df["ask_size_1"] >= 0) &
+    (df["total_bid_depth"] >= 0) &
+    (df["total_ask_depth"] >= 0)
+].copy()
+
+df = df.drop_duplicates(
+    subset=["token_id", "captured_at"],
+    keep="last"
+)
+
+df = df.sort_values(
+    ["token_id", "captured_at"]
+).reset_index(drop=True)
+
+print("\nData cleaning completed!")
+print("Cleaned shape:", df.shape)
+
+
+# ============================================================
+# 5. FEATURE ENGINEERING
+# ============================================================
+
+df["mid_price"] = (
+    df["best_bid"] + df["best_ask"]
+) / 2
+
+df["spread"] = (
+    df["best_ask"] - df["best_bid"]
+)
+
+df["relative_spread"] = (
+    df["spread"] / df["mid_price"]
+)
+
+depth_total = (
+    df["total_bid_depth"] +
+    df["total_ask_depth"]
+)
+
+df["obi"] = np.where(
+    depth_total > 0,
+    (
+        df["total_bid_depth"] -
+        df["total_ask_depth"]
+    ) / depth_total,
+    np.nan
+)
+
+microprice_denominator = (
+    df["bid_size_1"] +
+    df["ask_size_1"]
+)
+
+df["microprice"] = np.where(
+    microprice_denominator > 0,
+    (
+        df["best_ask"] * df["bid_size_1"] +
+        df["best_bid"] * df["ask_size_1"]
+    ) / microprice_denominator,
+    df["mid_price"]
+)
+
+feature_columns = [
+    "mid_price",
+    "spread",
+    "relative_spread",
+    "obi",
+    "microprice"
+]
+
+df[feature_columns] = (
+    df[feature_columns]
+    .replace([np.inf, -np.inf], np.nan)
+)
+
+df = df.dropna(
+    subset=feature_columns
+).copy()
+
+print("\nFeature engineering completed!")
+
+display(
+    df[
+        [
+            "mid_price",
+            "spread",
+            "relative_spread",
+            "obi",
+            "microprice"
+        ]
+    ].head()
+)
+
+
+# ============================================================
+# 6. 30-SECOND FUTURE PRICE MATCHING
+# ============================================================
+
+future_data = df[
+    [
+        "token_id",
+        "captured_at",
+        "mid_price",
+        "best_bid",
+        "best_ask"
+    ]
+].copy()
+
+future_data = future_data.rename(
+    columns={
+        "captured_at": "future_time",
+        "mid_price": "future_mid_price",
+        "best_bid": "future_best_bid",
+        "best_ask": "future_best_ask"
+    }
+)
+
+df["target_time"] = (
+    df["captured_at"] +
+    pd.Timedelta(seconds=FORWARD_SECONDS)
+)
+
+left_data = df.sort_values(
+    ["target_time", "token_id"]
+).copy()
+
+right_data = future_data.sort_values(
+    ["future_time", "token_id"]
+).copy()
+
+df = pd.merge_asof(
+    left_data,
+    right_data,
+    left_on="target_time",
+    right_on="future_time",
+    by="token_id",
+    direction="forward",
+    tolerance=pd.Timedelta(
+        seconds=MATCH_TOLERANCE_SECONDS
+    )
+)
+
+df["actual_horizon_seconds"] = (
+    df["future_time"] - df["captured_at"]
+).dt.total_seconds()
+
+df = df[
+    df["actual_horizon_seconds"].between(
+        FORWARD_SECONDS,
+        FORWARD_SECONDS + MATCH_TOLERANCE_SECONDS
+    )
+].copy()
+
+df["forward_return"] = (
+    df["future_mid_price"] - df["mid_price"]
+) / df["mid_price"]
+
+df["forward_return_bps"] = (
+    df["forward_return"] * 10000
+)
+
+print("\nFuture price matching completed!")
+print("Valid observations:", len(df))
+
+if len(df) == 0:
+    raise ValueError(
+        "No future observations matched. Check timestamp frequency."
+    )
+
+print(
+    "Average forward horizon:",
+    round(df["actual_horizon_seconds"].mean(), 2),
+    "seconds"
+)
+
+
+# ============================================================
+# 7. GENERATE TRADING SIGNALS
+# ============================================================
+
+df["signal"] = np.select(
+    [
+        df["obi"] > OBI_THRESHOLD,
+        df["obi"] < -OBI_THRESHOLD
+    ],
+    [
+        1,
+        -1
+    ],
+    default=0
+)
+
+df["signal_label"] = df["signal"].map(
+    {
+        1: "BUY",
+        -1: "SELL",
+        0: "NEUTRAL"
+    }
+)
+
+active_signals = df[
+    df["signal"] != 0
+].copy()
+
+print("\nSignal summary:")
+print(df["signal_label"].value_counts())
+
+print("\nTotal active signals:", len(active_signals))
+
+
+# ============================================================
+# 8. DIRECTIONAL ACCURACY
+# ============================================================
+
+directional_data = active_signals[
+    active_signals["forward_return"] != 0
+].copy()
+
+directional_data["correct_signal"] = np.where(
+    (
+        (directional_data["signal"] == 1) &
+        (directional_data["forward_return"] > 0)
+    ) |
+    (
+        (directional_data["signal"] == -1) &
+        (directional_data["forward_return"] < 0)
+    ),
+    1,
+    0
+)
+
+if len(directional_data) > 0:
+    directional_hit_rate = (
+        directional_data["correct_signal"].mean() * 100
+    )
+else:
+    directional_hit_rate = np.nan
+
+flat_signals = (
+    active_signals["forward_return"] == 0
+).sum()
+
+flat_rate = (
+    flat_signals / len(active_signals) * 100
+    if len(active_signals) > 0 else np.nan
+)
+
+print("\nDirectional observations:", len(directional_data))
+print("Flat observations:", flat_signals)
+print("Directional hit rate:", round(directional_hit_rate, 2), "%")
+print("Flat rate:", round(flat_rate, 2), "%")
+
+
+# ============================================================
+# 9. EXECUTION-BASED BACKTESTING
+# ============================================================
+
+trades = active_signals.copy()
+
+trades["entry_price"] = np.where(
+    trades["signal"] == 1,
+    trades["best_ask"],
+    trades["best_bid"]
+)
+
+trades["exit_price"] = np.where(
+    trades["signal"] == 1,
+    trades["future_best_bid"],
+    trades["future_best_ask"]
+)
+
+trades = trades.dropna(
+    subset=["entry_price", "exit_price"]
+).copy()
+
+trades["gross_pnl"] = np.where(
+    trades["signal"] == 1,
+    (
+        trades["exit_price"] -
+        trades["entry_price"]
+    ) * POSITION_SIZE,
+    (
+        trades["entry_price"] -
+        trades["exit_price"]
+    ) * POSITION_SIZE
+)
+
+trades["slippage_cost"] = (
+    trades["entry_price"] +
+    trades["exit_price"]
+) * SLIPPAGE_BPS / 10000 * POSITION_SIZE
+
+trades["fee_cost"] = (
+    trades["entry_price"] +
+    trades["exit_price"]
+) * FEE_BPS / 10000 * POSITION_SIZE
+
+trades["net_pnl"] = (
+    trades["gross_pnl"] -
+    trades["slippage_cost"] -
+    trades["fee_cost"]
+)
+
+print("\nBacktesting completed!")
+print("Total trades:", len(trades))
+
+
+# ============================================================
+# 10. PERFORMANCE METRICS
+# ============================================================
+
+def calculate_metrics(data, pnl_column="net_pnl"):
+
+    if data.empty:
+        return {
+            "Total Trades": 0,
+            "Winning Trades": 0,
+            "Losing Trades": 0,
+            "Zero PnL Trades": 0,
+            "Win Rate (%)": np.nan,
+            "Gross PnL": 0.0,
+            "Net PnL": 0.0,
+            "Average PnL": np.nan,
+            "Profit Factor": np.nan,
+            "Max Drawdown": 0.0
+        }
+
+    pnl = pd.to_numeric(
+        data[pnl_column],
+        errors="coerce"
+    ).dropna()
+
+    if len(pnl) == 0:
+        return {
+            "Total Trades": 0,
+            "Winning Trades": 0,
+            "Losing Trades": 0,
+            "Zero PnL Trades": 0,
+            "Win Rate (%)": np.nan,
+            "Gross PnL": 0.0,
+            "Net PnL": 0.0,
+            "Average PnL": np.nan,
+            "Profit Factor": np.nan,
+            "Max Drawdown": 0.0
+        }
+
+    positive_pnl = pnl[pnl > 0].sum()
+    negative_pnl = pnl[pnl < 0].sum()
+
+    wins = (pnl > 0).sum()
+    losses = (pnl < 0).sum()
+    zeros = (pnl == 0).sum()
+
+    total_trades = len(pnl)
+
+    win_rate = (
+        wins / total_trades * 100
+    )
+
+    if negative_pnl < 0:
+        profit_factor = (
+            positive_pnl / abs(negative_pnl)
+        )
+    else:
+        profit_factor = np.inf if positive_pnl > 0 else np.nan
+
+    if "future_time" in data.columns:
+        ordered = data.loc[pnl.index].sort_values(
+            "future_time"
+        )
+        ordered_pnl = pd.to_numeric(
+            ordered[pnl_column],
+            errors="coerce"
+        ).fillna(0)
+    else:
+        ordered_pnl = pnl
+
+    cumulative = ordered_pnl.cumsum()
+    drawdown = cumulative - cumulative.cummax()
+
+    max_drawdown = (
+        drawdown.min() if len(drawdown) else 0
+    )
+
+    return {
+        "Total Trades": int(total_trades),
+        "Winning Trades": int(wins),
+        "Losing Trades": int(losses),
+        "Zero PnL Trades": int(zeros),
+        "Win Rate (%)": round(win_rate, 2),
+        "Gross PnL": round(float(data["gross_pnl"].sum()), 5),
+        "Net PnL": round(float(pnl.sum()), 5),
+        "Average PnL": round(float(pnl.mean()), 6),
+        "Profit Factor": round(float(profit_factor), 4)
+            if np.isfinite(profit_factor) else profit_factor,
+        "Max Drawdown": round(float(max_drawdown), 5)
+    }
+
+
+overlap_metrics = calculate_metrics(trades)
+
+print("\nOVERLAPPING BACKTEST RESULTS")
+print("=" * 40)
+
+for key, value in overlap_metrics.items():
+    print(f"{key}: {value}")
+
+
+# ============================================================
+# 11. BUY VS SELL ANALYSIS
+# ============================================================
+
+if not trades.empty:
+
+    buy_sell_analysis = (
+        trades.groupby("signal_label")
+        .agg(
+            total_trades=("net_pnl", "count"),
+            average_net_pnl=("net_pnl", "mean"),
+            total_net_pnl=("net_pnl", "sum"),
+            average_entry=("entry_price", "mean"),
+            average_exit=("exit_price", "mean"),
+            win_rate=(
+                "net_pnl",
+                lambda x: (x > 0).mean() * 100
+            )
+        )
+        .reset_index()
+    )
+
+else:
+    buy_sell_analysis = pd.DataFrame()
+
+print("\nBUY VS SELL ANALYSIS")
+display(buy_sell_analysis)
+
+
+# ============================================================
+# 12. COST SENSITIVITY ANALYSIS
+# ============================================================
+
+cost_results = []
+
+for cost_bps in [0, 10, 25, 50, 100]:
+
+    temp = trades.copy()
+
+    temp["scenario_cost"] = (
+        temp["entry_price"] +
+        temp["exit_price"]
+    ) * cost_bps / 10000 * POSITION_SIZE
+
+    temp["scenario_net_pnl"] = (
+        temp["gross_pnl"] - temp["scenario_cost"]
+    )
+
+    metrics = calculate_metrics(
+        temp,
+        pnl_column="scenario_net_pnl"
+    )
+
+    cost_results.append({
+        "Cost_BPS_Per_Side": cost_bps,
+        "Total_Trades": metrics["Total Trades"],
+        "Gross_PnL": temp["gross_pnl"].sum(),
+        "Total_Cost": temp["scenario_cost"].sum(),
+        "Net_PnL": temp["scenario_net_pnl"].sum(),
+        "Average_PnL": metrics["Average PnL"],
+        "Win_Rate": metrics["Win Rate (%)"]
+    })
+
+cost_analysis = pd.DataFrame(cost_results)
+
+print("\nCOST SENSITIVITY ANALYSIS")
+display(cost_analysis.round(5))
+
+
+# ============================================================
+# 13. NON-OVERLAPPING BACKTEST
+# ============================================================
+
+def run_non_overlapping_backtest(
+    trade_data,
+    slippage_bps=0,
+    fee_bps=0
+):
+
+    if trade_data.empty:
+        return pd.DataFrame()
+
+    ordered = trade_data.sort_values(
+        ["market_slug", "captured_at"]
+    ).copy()
+
+    accepted = []
+
+    for market, group in ordered.groupby("market_slug"):
+
+        last_exit_time = pd.Timestamp.min.tz_localize("UTC")
+
+        for _, row in group.iterrows():
+
+            entry_time = row["captured_at"]
+            exit_time = row["future_time"]
+
+            if pd.isna(exit_time):
+                continue
+
+            if entry_time < last_exit_time:
+                continue
+
+            entry_price = row["entry_price"]
+            exit_price = row["exit_price"]
+
+            gross = row["gross_pnl"]
+
+            slippage_cost = (
+                entry_price + exit_price
+            ) * slippage_bps / 10000 * POSITION_SIZE
+
+            fee_cost = (
+                entry_price + exit_price
+            ) * fee_bps / 10000 * POSITION_SIZE
+
+            net = (
+                gross -
+                slippage_cost -
+                fee_cost
+            )
+
+            record = row.to_dict()
+
+            record["scenario_slippage_cost"] = slippage_cost
+            record["scenario_fee_cost"] = fee_cost
+            record["scenario_net_pnl"] = net
+
+            accepted.append(record)
+
+            last_exit_time = exit_time
+
+    return pd.DataFrame(accepted)
+
+
+non_overlap = run_non_overlapping_backtest(
+    trades,
+    slippage_bps=SLIPPAGE_BPS,
+    fee_bps=FEE_BPS
+)
+
+print("\nNON-OVERLAPPING BACKTEST")
+print("=" * 40)
+
+print("Accepted trades:", len(non_overlap))
+print("Skipped overlapping trades:", len(trades) - len(non_overlap))
+
+if not non_overlap.empty:
+
+    non_overlap_metrics = calculate_metrics(
+        non_overlap,
+        pnl_column="scenario_net_pnl"
+    )
+
+    print("\nNON-OVERLAPPING PERFORMANCE METRICS")
+
+    for key, value in non_overlap_metrics.items():
+        print(f"{key}: {value}")
+
+    print(
+        "\nNon-overlapping Net PnL:",
+        round(non_overlap["scenario_net_pnl"].sum(), 5)
+    )
+
+else:
+    print("No non-overlapping trades available.")
+
+
+# ============================================================
+# 14. THRESHOLD SENSITIVITY
+# ============================================================
+
+threshold_results = []
+
+for threshold in [0.05, 0.10, 0.15, 0.20, 0.25, 0.30]:
+
+    temp = df.copy()
+
+    temp["temp_signal"] = np.select(
+        [
+            temp["obi"] > threshold,
+            temp["obi"] < -threshold
+        ],
+        [1, -1],
+        default=0
+    )
+
+    temp = temp[
+        temp["temp_signal"] != 0
+    ].copy()
+
+    temp["temp_entry"] = np.where(
+        temp["temp_signal"] == 1,
+        temp["best_ask"],
+        temp["best_bid"]
+    )
+
+    temp["temp_exit"] = np.where(
+        temp["temp_signal"] == 1,
+        temp["future_best_bid"],
+        temp["future_best_ask"]
+    )
+
+    temp = temp.dropna(
+        subset=["temp_entry", "temp_exit"]
+    )
+
+    temp["temp_gross_pnl"] = np.where(
+        temp["temp_signal"] == 1,
+        (
+            temp["temp_exit"] - temp["temp_entry"]
+        ) * POSITION_SIZE,
+        (
+            temp["temp_entry"] - temp["temp_exit"]
+        ) * POSITION_SIZE
+    )
+
+    temp["temp_net_pnl"] = (
+        temp["temp_gross_pnl"] -
+        (
+            temp["temp_entry"] + temp["temp_exit"]
+        ) * FEE_BPS / 10000 * POSITION_SIZE -
+        (
+            temp["temp_entry"] + temp["temp_exit"]
+        ) * SLIPPAGE_BPS / 10000 * POSITION_SIZE
+    )
+
+    threshold_results.append({
+        "OBI_Threshold": threshold,
+        "Total_Trades": len(temp),
+        "Net_PnL": temp["temp_net_pnl"].sum(),
+        "Average_PnL": temp["temp_net_pnl"].mean(),
+        "Win_Rate": (
+            (temp["temp_net_pnl"] > 0).mean() * 100
+            if len(temp) else np.nan
+        )
+    })
+
+threshold_analysis = pd.DataFrame(
+    threshold_results
+)
+
+print("\nTHRESHOLD SENSITIVITY")
+display(threshold_analysis.round(5))
+
+
+# ============================================================
+# 15. CHARTS
+# ============================================================
+
+plt.figure(figsize=(12, 5))
+plt.plot(df["captured_at"], df["mid_price"])
+plt.title("Mid Price Over Time")
+plt.xlabel("Time")
+plt.ylabel("Mid Price")
+plt.xticks(rotation=30)
+plt.tight_layout()
+plt.show()
+
+
+plt.figure(figsize=(12, 5))
+plt.plot(df["captured_at"], df["obi"])
+plt.axhline(OBI_THRESHOLD, linestyle="--")
+plt.axhline(-OBI_THRESHOLD, linestyle="--")
+plt.title("Order Book Imbalance")
+plt.xlabel("Time")
+plt.ylabel("OBI")
+plt.xticks(rotation=30)
+plt.tight_layout()
+plt.show()
+
+
+plt.figure(figsize=(8, 5))
+plt.hist(df["spread"], bins=40)
+plt.title("Bid-Ask Spread Distribution")
+plt.xlabel("Spread")
+plt.ylabel("Frequency")
+plt.tight_layout()
+plt.show()
+
+
+if not trades.empty:
+
+    chart_trades = trades.sort_values(
+        "future_time"
+    ).copy()
+
+    chart_trades["cumulative_pnl"] = (
+        chart_trades["net_pnl"].cumsum()
+    )
+
+    chart_trades["drawdown"] = (
+        chart_trades["cumulative_pnl"] -
+        chart_trades["cumulative_pnl"].cummax()
+    )
+
+    plt.figure(figsize=(12, 5))
+    plt.plot(
+        chart_trades["future_time"],
+        chart_trades["cumulative_pnl"]
+    )
+    plt.title("Cumulative Trading PnL")
+    plt.xlabel("Time")
+    plt.ylabel("Cumulative PnL")
+    plt.xticks(rotation=30)
+    plt.tight_layout()
+    plt.show()
+
+
+    plt.figure(figsize=(12, 5))
+    plt.plot(
+        chart_trades["future_time"],
+        chart_trades["drawdown"]
+    )
+    plt.title("Trading Drawdown")
+    plt.xlabel("Time")
+    plt.ylabel("Drawdown")
+    plt.xticks(rotation=30)
+    plt.tight_layout()
+    plt.show()
+
+
+# ============================================================
+# 16. EXPORT CSV FILES
+# ============================================================
+
+df.to_csv(
+    "project1_output.csv",
+    index=False
+)
+
+trades.to_csv(
+    "project1_trades.csv",
+    index=False
+)
+
+cost_analysis.to_csv(
+    "threshold_cost_analysis.csv",
+    index=False
+)
+
+buy_sell_analysis.to_csv(
+    "buy_sell_analysis.csv",
+    index=False
+)
+
+non_overlap.to_csv(
+    "non_overlapping_trades.csv",
+    index=False
+)
+
+threshold_analysis.to_csv(
+    "obi_threshold_analysis.csv",
+    index=False
+)
+
+print("\nCSV files exported successfully!")
+
+
+# ============================================================
+# 17. SQLITE DATABASE EXPORT
+# ============================================================
+
+with sqlite3.connect(OUTPUT_DB) as conn:
+
+    df.to_sql(
+        "orderbook_analysis",
+        conn,
+        if_exists="replace",
+        index=False
+    )
+
+    trades.to_sql(
+        "trading_results",
+        conn,
+        if_exists="replace",
+        index=False
+    )
+
+    cost_analysis.to_sql(
+        "cost_sensitivity",
+        conn,
+        if_exists="replace",
+        index=False
+    )
+
+    buy_sell_analysis.to_sql(
+        "buy_sell_analysis",
+        conn,
+        if_exists="replace",
+        index=False
+    )
+
+    non_overlap.to_sql(
+        "non_overlapping_trades",
+        conn,
+        if_exists="replace",
+        index=False
+    )
+
+    threshold_analysis.to_sql(
+        "threshold_analysis",
+        conn,
+        if_exists="replace",
+        index=False
+    )
+
+print("SQLite database created:", OUTPUT_DB)
+
+
+# ============================================================
+# 18. VERIFY DATABASE
+# ============================================================
+
+with sqlite3.connect(OUTPUT_DB) as conn:
+
+    tables = pd.read_sql_query(
+        """
+        SELECT name
+        FROM sqlite_master
+        WHERE type='table'
+        """,
+        conn
+    )
+
+    print("\nDatabase tables:")
+    display(tables)
+
+    verification = pd.read_sql_query(
+        """
+        SELECT
+            COUNT(*) AS total_trades,
+            SUM(net_pnl) AS total_net_pnl,
+            AVG(net_pnl) AS average_net_pnl
+        FROM trading_results
+        """,
+        conn
+    )
+
+    print("\nDatabase verification:")
+    display(verification)
+
+
+# ============================================================
+# 19. FINAL PROJECT SUMMARY
+# ============================================================
+
+print("\n" + "=" * 55)
+print("PROJECT 1: ORDER BOOK IMBALANCE ANALYZER")
+print("=" * 55)
+
+print("Dataset rows:", len(df))
+print("Active signals:", len(active_signals))
+print("Overlapping trades:", len(trades))
+print("Non-overlapping trades:", len(non_overlap))
+
+if not trades.empty:
+
+    print(
+        "Overlapping Net PnL:",
+        round(trades["net_pnl"].sum(), 5)
+    )
+
+if not non_overlap.empty:
+
+    print(
+        "Non-overlapping Net PnL:",
+        round(non_overlap["scenario_net_pnl"].sum(), 5)
+    )
+
+print("\nGenerated files:")
+print("- project1_output.csv")
+print("- project1_trades.csv")
+print("- threshold_cost_analysis.csv")
+print("- buy_sell_analysis.csv")
+print("- non_overlapping_trades.csv")
+print("- obi_threshold_analysis.csv")
+print("- hft_project1.db")
+
+print("\nPROJECT EXECUTION COMPLETED!")
